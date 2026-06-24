@@ -4,11 +4,16 @@ import numpy as np
 import pytest
 import torch
 
-from pose_async import PoseLandmark, PoseResult
-from pose_autoencoder import PoseAutoencoder, load_checkpoint, save_checkpoint
-from pose_features import PoseFeatureExtractor, feature_dim
-from pose_latent_stream import PoseLatentStream
-from train_pose_autoencoder import load_feature_matrix, train_autoencoder
+from pose_encoding.pose_autoencoder import PoseAutoencoder, load_checkpoint, save_checkpoint
+from pose_encoding.pose_latent_stream import PoseLatentStream
+from pose_encoding.train_pose_autoencoder import load_feature_matrix, train_autoencoder
+from streaming.pose import PoseFeatureExtractor, PoseLandmark, PoseResult, feature_dim
+
+
+def output_path(name: str) -> Path:
+    path = Path("test_outputs") / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def make_landmarks(
@@ -90,6 +95,38 @@ def test_velocity_accounts_for_elapsed_time() -> None:
     assert np.allclose(fast_frame.vector[24:], slow_frame.vector[24:] * 2)
 
 
+def test_live_smoothing_reduces_isolated_position_jumps() -> None:
+    raw = PoseFeatureExtractor(
+        include_velocity=False,
+        use_world_landmarks=False,
+    )
+    smooth = PoseFeatureExtractor(
+        include_velocity=False,
+        use_world_landmarks=False,
+        smooth_positions=True,
+        median_window=3,
+        mean_window=1,
+    )
+
+    raw.extract(make_pose(timestamp_ms=100))
+    raw_spike = raw.extract(make_pose(timestamp_ms=200, wrist_offset=6.0))
+    raw_recovered = raw.extract(make_pose(timestamp_ms=300))
+
+    smooth.extract(make_pose(timestamp_ms=100))
+    smooth_spike = smooth.extract(make_pose(timestamp_ms=200, wrist_offset=6.0))
+    smooth_recovered = smooth.extract(make_pose(timestamp_ms=300))
+
+    first_raw_position = raw_recovered.vector[:24]
+    raw_jump = np.linalg.norm(raw_spike.vector[:24] - first_raw_position)
+    smooth_jump = np.linalg.norm(smooth_spike.vector[:24] - first_raw_position)
+
+    assert smooth_jump < raw_jump
+    np.testing.assert_allclose(
+        smooth_recovered.vector[:24],
+        first_raw_position,
+    )
+
+
 def test_world_landmarks_are_preferred() -> None:
     image_only = PoseFeatureExtractor(
         include_velocity=False,
@@ -129,13 +166,11 @@ def test_no_pose_returns_zero_frame_and_resets_velocity() -> None:
     assert np.allclose(after_gap.vector[24:], 0.0)
 
 
-def test_autoencoder_architecture_and_checkpoint_round_trip(
-    tmp_path: Path,
-) -> None:
+def test_autoencoder_architecture_and_checkpoint_round_trip() -> None:
     model = PoseAutoencoder(latent_dim=4, hidden_dims=(16, 8))
     features = torch.randn(2, 48)
     reconstruction, latent = model(features)
-    path = tmp_path / "pose.pt"
+    path = output_path("pose_round_trip.pt")
 
     save_checkpoint(path, model, {"source": "test"})
     restored, config = load_checkpoint(path)
@@ -168,16 +203,16 @@ def test_training_tracks_validation_loss() -> None:
     assert history["train_loss"][-1] < history["train_loss"][0]
 
 
-def test_feature_loader_rejects_empty_dataset(tmp_path: Path) -> None:
-    path = tmp_path / "empty.npz"
+def test_feature_loader_rejects_empty_dataset() -> None:
+    path = output_path("empty_pose_features.npz")
     np.savez(path, features=np.empty((0, 48), dtype=np.float32))
 
     with pytest.raises(ValueError, match="empty"):
         load_feature_matrix(path)
 
 
-def test_feature_loader_reads_npz_features(tmp_path: Path) -> None:
-    path = tmp_path / "features.npz"
+def test_feature_loader_reads_npz_features() -> None:
+    path = output_path("pose_features.npz")
     features = np.ones((3, 48), dtype=np.float32)
     np.savez(
         path,
@@ -188,8 +223,8 @@ def test_feature_loader_reads_npz_features(tmp_path: Path) -> None:
     assert np.array_equal(load_feature_matrix(path), features)
 
 
-def test_feature_loader_rejects_missing_features_array(tmp_path: Path) -> None:
-    path = tmp_path / "missing_features.npz"
+def test_feature_loader_rejects_missing_features_array() -> None:
+    path = output_path("missing_pose_features.npz")
     np.savez(path, timestamp_ms=np.array([10], dtype=np.int64))
 
     with pytest.raises(ValueError, match="features"):
@@ -227,7 +262,7 @@ def test_latent_stream_polls_estimator_and_returns_full_frame() -> None:
     assert latest.pose_detected is True
 
 
-def test_latent_stream_from_checkpoint(tmp_path: Path) -> None:
+def test_latent_stream_from_checkpoint() -> None:
     class FakeEstimator:
         def get_latest(self):
             return None
@@ -235,7 +270,7 @@ def test_latent_stream_from_checkpoint(tmp_path: Path) -> None:
         def get_nowait(self):
             return None
 
-    checkpoint = tmp_path / "pose.pt"
+    checkpoint = output_path("pose_stream_checkpoint.pt")
     save_checkpoint(checkpoint, PoseAutoencoder(input_dim=24), {})
 
     stream = PoseLatentStream.from_checkpoint(

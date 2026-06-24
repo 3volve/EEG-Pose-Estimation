@@ -8,8 +8,16 @@ import time
 
 import numpy as np
 
-from pose_async import AsyncPoseEstimator
-from pose_features import PoseFeatureExtractor, feature_dim
+from config import (
+    COLLECT_DURATION_S,
+    POSE_CAMERA_INDEX,
+    POSE_CAPTURE_MIN_CONFIDENCE,
+    POSE_INCLUDE_VELOCITY,
+    POSE_MODEL,
+    POSE_TARGET_FPS,
+    POSE_USE_WORLD_LANDMARKS,
+)
+from streaming.pose import AsyncPoseEstimator, PoseFeatureExtractor, feature_dim
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,14 +26,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="models/pose_landmarker_full.task",
+        default=POSE_MODEL,
         help="MediaPipe pose model path",
     )
     parser.add_argument("--out", default="pose_features.npz")
-    parser.add_argument("--duration", type=float, default=60.0)
-    parser.add_argument("--camera-index", type=int, default=0)
-    parser.add_argument("--fps", type=float, default=30.0)
-    parser.add_argument("--min-confidence", type=float, default=0.5)
+    parser.add_argument("--duration", type=float, default=COLLECT_DURATION_S)
+    parser.add_argument("--camera-index", type=int, default=POSE_CAMERA_INDEX)
+    parser.add_argument("--fps", type=float, default=POSE_TARGET_FPS)
+    parser.add_argument("--min-confidence", type=float, default=POSE_CAPTURE_MIN_CONFIDENCE)
     parser.add_argument("--mirror", action="store_true")
     parser.add_argument(
         "--no-preview",
@@ -40,10 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-velocity",
         action="store_true",
-        help=(
-            "Save 24 position features instead of 48 position/velocity "
-            "features"
-        ),
+        default=not POSE_INCLUDE_VELOCITY,
+        help="Save 24 position features instead of 48 position/velocity features",
     )
     return parser.parse_args()
 
@@ -67,7 +73,7 @@ def main() -> None:
     )
     extractor = PoseFeatureExtractor(
         include_velocity=not args.no_velocity,
-        use_world_landmarks=not args.image_landmarks,
+        use_world_landmarks=POSE_USE_WORLD_LANDMARKS and not args.image_landmarks,
     )
     vectors: list[np.ndarray] = []
     timestamp_ms: list[int] = []

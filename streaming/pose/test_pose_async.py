@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from pose_async import AsyncPoseEstimator, PoseLandmark, PoseResult
+from streaming.pose import AsyncPoseEstimator, PoseLandmark, PoseResult
 
 
 def make_landmark(value: float) -> SimpleNamespace:

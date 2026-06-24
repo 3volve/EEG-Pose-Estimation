@@ -9,13 +9,15 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from config import POSE_AUTOENCODER_HIDDEN_DIMS, POSE_AUTOENCODER_LATENT_DIM
+
 
 class PoseAutoencoder(nn.Module):
     def __init__(
         self,
         input_dim: int = 48,
-        latent_dim: int = 8,
-        hidden_dims: tuple[int, int] = (64, 32),
+        latent_dim: int = POSE_AUTOENCODER_LATENT_DIM,
+        hidden_dims: tuple[int, int] = POSE_AUTOENCODER_HIDDEN_DIMS,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim

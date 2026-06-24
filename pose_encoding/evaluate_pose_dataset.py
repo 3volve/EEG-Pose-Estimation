@@ -11,7 +11,14 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from pose_autoencoder import load_checkpoint
+from config import (
+    DEFAULT_DEVICE,
+    POSE_DATA_GLOB,
+    POSE_EVAL_LOW_CONFIDENCE,
+    POSE_EVAL_OUTLIER_PERCENTILE,
+    POSE_PREP_GAP_MS,
+)
+from .pose_autoencoder import load_checkpoint
 
 
 LANDMARK_NAMES = (
@@ -64,30 +71,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "paths",
         nargs="*",
-        default=["data/*.npz"],
+        default=[POSE_DATA_GLOB],
         help="Input .npz files or glob patterns",
     )
     parser.add_argument(
         "--checkpoint",
         help="Optional pose autoencoder checkpoint to evaluate",
     )
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default=DEFAULT_DEVICE)
     parser.add_argument(
         "--gap-ms",
         type=_positive_float,
-        default=75.0,
+        default=POSE_PREP_GAP_MS,
         help="Timestamp gap threshold for reporting dropped/late samples",
     )
     parser.add_argument(
         "--low-confidence",
         type=float,
-        default=0.7,
+        default=POSE_EVAL_LOW_CONFIDENCE,
         help="Confidence threshold for low-confidence sample counts",
     )
     parser.add_argument(
         "--outlier-percentile",
         type=float,
-        default=99.5,
+        default=POSE_EVAL_OUTLIER_PERCENTILE,
         help="Training-set percentile used for velocity outlier thresholds",
     )
     parser.add_argument(

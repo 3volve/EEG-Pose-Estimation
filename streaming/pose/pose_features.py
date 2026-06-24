@@ -7,7 +7,13 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from pose_async import PoseResult
+from config import (
+    POSE_INCLUDE_VELOCITY,
+    POSE_LIVE_MEAN_WINDOW,
+    POSE_LIVE_MEDIAN_WINDOW,
+    POSE_USE_WORLD_LANDMARKS,
+)
+from .pose_async import PoseResult
 
 
 UPPER_BODY_LANDMARKS = [11, 12, 13, 14, 15, 16, 23, 24]
@@ -19,7 +25,7 @@ _RIGHT_HIP = 24
 _POSITION_DIM = len(UPPER_BODY_LANDMARKS) * 3
 
 
-def feature_dim(include_velocity: bool = True) -> int:
+def feature_dim(include_velocity: bool = POSE_INCLUDE_VELOCITY) -> int:
     return _POSITION_DIM * (2 if include_velocity else 1)
 
 
@@ -37,19 +43,29 @@ class PoseFeatureExtractor:
 
     def __init__(
         self,
-        include_velocity: bool = True,
-        use_world_landmarks: bool = True,
+        include_velocity: bool = POSE_INCLUDE_VELOCITY,
+        use_world_landmarks: bool = POSE_USE_WORLD_LANDMARKS,
+        smooth_positions: bool = False,
+        median_window: int = POSE_LIVE_MEDIAN_WINDOW,
+        mean_window: int = POSE_LIVE_MEAN_WINDOW,
         min_scale: float = 1e-6,
     ) -> None:
         self.include_velocity = include_velocity
         self.use_world_landmarks = use_world_landmarks
+        self.smooth_positions = smooth_positions
+        self.median_window = median_window
+        self.mean_window = mean_window
         self.min_scale = min_scale
         self._previous_positions: NDArray[np.float32] | None = None
         self._previous_timestamp_ms: int | None = None
+        self._position_history: list[NDArray[np.float32]] = []
+        self._median_history: list[NDArray[np.float32]] = []
 
     def reset(self) -> None:
         self._previous_positions = None
         self._previous_timestamp_ms = None
+        self._position_history.clear()
+        self._median_history.clear()
 
     def extract(self, result: PoseResult) -> PoseFeatureFrame:
         if not result.pose_detected:
@@ -83,6 +99,9 @@ class PoseFeatureExtractor:
             return self._empty_frame(result)
 
         flat_positions = positions.reshape(_POSITION_DIM)
+        if self.smooth_positions:
+            flat_positions = self._smooth(flat_positions)
+
         if self.include_velocity:
             if self._previous_positions is None:
                 velocity = np.zeros_like(flat_positions)
@@ -108,6 +127,22 @@ class PoseFeatureExtractor:
             pose_detected=True,
             confidence=_landmark_confidence(landmarks),
         )
+
+    def _smooth(self, flat_positions: NDArray[np.float32]) -> NDArray[np.float32]:
+        self._position_history.append(flat_positions.copy())
+        self._position_history = self._position_history[-self.median_window :]
+
+        median_position = np.median(
+            np.stack(self._position_history, axis=0),
+            axis=0,
+        ).astype(np.float32, copy=False)
+        self._median_history.append(median_position)
+        self._median_history = self._median_history[-self.mean_window :]
+
+        return np.mean(
+            np.stack(self._median_history, axis=0),
+            axis=0,
+        ).astype(np.float32, copy=False)
 
     def _empty_frame(self, result: PoseResult) -> PoseFeatureFrame:
         return PoseFeatureFrame(

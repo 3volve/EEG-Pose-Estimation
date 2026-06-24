@@ -12,7 +12,15 @@ from numpy.typing import NDArray
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
-from pose_autoencoder import PoseAutoencoder, save_checkpoint
+from config import (
+    DEFAULT_DEVICE,
+    POSE_AUTOENCODER_BATCH_SIZE,
+    POSE_AUTOENCODER_EPOCHS,
+    POSE_AUTOENCODER_LATENT_DIM,
+    POSE_AUTOENCODER_LR,
+    POSE_AUTOENCODER_VAL_SPLIT,
+)
+from .pose_autoencoder import PoseAutoencoder, save_checkpoint
 
 
 def _positive_int(value: str) -> int:
@@ -68,12 +76,12 @@ def load_feature_matrix(path: str | Path) -> NDArray[np.float32]:
 def train_autoencoder(
     features: NDArray[np.float32],
     *,
-    latent_dim: int = 8,
-    epochs: int = 100,
-    batch_size: int = 128,
-    lr: float = 1e-3,
-    val_split: float = 0.1,
-    device: str | torch.device = "cpu",
+    latent_dim: int = POSE_AUTOENCODER_LATENT_DIM,
+    epochs: int = POSE_AUTOENCODER_EPOCHS,
+    batch_size: int = POSE_AUTOENCODER_BATCH_SIZE,
+    lr: float = POSE_AUTOENCODER_LR,
+    val_split: float = POSE_AUTOENCODER_VAL_SPLIT,
+    device: str | torch.device = DEFAULT_DEVICE,
     seed: int = 0,
     verbose: bool = False,
 ) -> tuple[PoseAutoencoder, dict[str, list[float]]]:
@@ -183,11 +191,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data", required=True, help="Input .npz feature archive")
     parser.add_argument("--out", required=True, help="Output checkpoint path")
-    parser.add_argument("--latent-dim", type=_positive_int, default=8)
-    parser.add_argument("--epochs", type=_positive_int, default=100)
-    parser.add_argument("--batch-size", type=_positive_int, default=128)
-    parser.add_argument("--lr", type=_positive_float, default=1e-3)
-    parser.add_argument("--val-split", type=_validation_split, default=0.1)
+    parser.add_argument("--latent-dim", type=_positive_int, default=POSE_AUTOENCODER_LATENT_DIM)
+    parser.add_argument("--epochs", type=_positive_int, default=POSE_AUTOENCODER_EPOCHS)
+    parser.add_argument("--batch-size", type=_positive_int, default=POSE_AUTOENCODER_BATCH_SIZE)
+    parser.add_argument("--lr", type=_positive_float, default=POSE_AUTOENCODER_LR)
+    parser.add_argument("--val-split", type=_validation_split, default=POSE_AUTOENCODER_VAL_SPLIT)
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 

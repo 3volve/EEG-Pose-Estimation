@@ -11,6 +11,8 @@ from types import ModuleType
 from typing import Any, Iterator
 import warnings
 
+from config import POSE_CAMERA_INDEX, POSE_RESULT_QUEUE_SIZE, POSE_TARGET_FPS
+
 
 @dataclass(frozen=True, slots=True)
 class PoseLandmark:
@@ -40,9 +42,9 @@ class AsyncPoseEstimator:
     def __init__(
         self,
         model_path: str,
-        camera_index: int = 0,
-        target_fps: float = 30.0,
-        result_queue_size: int = 128,
+        camera_index: int = POSE_CAMERA_INDEX,
+        target_fps: float = POSE_TARGET_FPS,
+        result_queue_size: int = POSE_RESULT_QUEUE_SIZE,
         mirror_frame: bool = False,
         draw_preview: bool = False,
     ) -> None:

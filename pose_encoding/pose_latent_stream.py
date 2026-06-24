@@ -9,8 +9,17 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from pose_autoencoder import PoseAutoencoder, load_checkpoint
-from pose_features import PoseFeatureExtractor, feature_dim
+from config import (
+    DEFAULT_DEVICE,
+    POSE_INCLUDE_VELOCITY,
+    POSE_LIVE_MEAN_WINDOW,
+    POSE_LIVE_MEDIAN_WINDOW,
+    POSE_LIVE_SMOOTHING,
+    POSE_USE_WORLD_LANDMARKS,
+)
+from streaming.pose import PoseFeatureExtractor, feature_dim
+
+from .pose_autoencoder import PoseAutoencoder, load_checkpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +42,7 @@ class PoseLatentStream:
         pose_estimator,
         autoencoder: PoseAutoencoder,
         feature_extractor: PoseFeatureExtractor,
-        device: str = "cpu",
+        device: str = DEFAULT_DEVICE,
     ) -> None:
         self.pose_estimator = pose_estimator
         self.autoencoder = autoencoder.to(device)
@@ -51,14 +60,18 @@ class PoseLatentStream:
         cls,
         pose_estimator,
         checkpoint_path: str | Path,
-        include_velocity: bool = True,
-        use_world_landmarks: bool = True,
-        device: str = "cpu",
+        include_velocity: bool = POSE_INCLUDE_VELOCITY,
+        use_world_landmarks: bool = POSE_USE_WORLD_LANDMARKS,
+        smooth_positions: bool = POSE_LIVE_SMOOTHING,
+        device: str = DEFAULT_DEVICE,
     ) -> PoseLatentStream:
         model, _ = load_checkpoint(checkpoint_path, map_location=device)
         extractor = PoseFeatureExtractor(
             include_velocity=include_velocity,
             use_world_landmarks=use_world_landmarks,
+            smooth_positions=smooth_positions,
+            median_window=POSE_LIVE_MEDIAN_WINDOW,
+            mean_window=POSE_LIVE_MEAN_WINDOW,
         )
         expected_dim = feature_dim(include_velocity)
         if model.input_dim != expected_dim:

@@ -1,2 +1,6 @@
-/__pycache__
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/test_outputs/
+/eval_tools/
 /.agents

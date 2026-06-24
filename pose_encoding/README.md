@@ -1,11 +1,11 @@
-# Asynchronous MediaPipe Pose Streaming
+# Pose Encoding
 
-`pose_async.py` captures webcam frames on a background thread and submits them
-to MediaPipe Pose Landmarker in `LIVE_STREAM` mode. Results carry monotonic
-timestamps suitable for later alignment with EEG packets.
+This package trains and runs the pose autoencoder that turns normalized pose
+features into latent training targets. Webcam capture and MediaPipe landmark
+streaming live in `streaming.pose`.
 
 The configured `synaptech-arm` conda environment uses Python 3.12. Required
-packages are listed in `requirements-pose.txt`.
+packages are listed in the local `requirements.txt`.
 
 ## Model
 
@@ -20,7 +20,7 @@ https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker
 
 ```powershell
 conda activate synaptech-arm
-python demo_pose_async.py --model_path C:\path\to\pose_landmarker_lite.task --mirror
+python -m pose_encoding.collect_pose_features --model C:\path\to\pose_landmarker_lite.task --mirror
 ```
 
 The preview draws the latest predicted pose as green connections with red
@@ -31,7 +31,7 @@ terminal to stop.
 Use the module directly:
 
 ```python
-from pose_async import AsyncPoseEstimator
+from streaming.pose import AsyncPoseEstimator
 
 estimator = AsyncPoseEstimator("pose_landmarker_lite.task")
 estimator.start()

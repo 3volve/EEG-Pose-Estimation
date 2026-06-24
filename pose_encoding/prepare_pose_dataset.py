@@ -9,6 +9,15 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from config import (
+    POSE_PREP_DROP_START_SECONDS,
+    POSE_PREP_GAP_MS,
+    POSE_PREP_MEAN_WINDOW,
+    POSE_PREP_MEDIAN_WINDOW,
+    POSE_PREP_MIN_CONFIDENCE,
+    POSE_PREP_MIN_SEGMENT_SAMPLES,
+    POSE_TARGET_FPS,
+)
 
 def _nonnegative_float(value: str) -> float:
     parsed = float(value)
@@ -44,37 +53,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--drop-start-seconds",
         type=_nonnegative_float,
-        default=3.0,
+        default=POSE_PREP_DROP_START_SECONDS,
         help="Drop this much time from the start of each input archive",
     )
     parser.add_argument(
         "--min-confidence",
         type=float,
-        default=0.7,
+        default=POSE_PREP_MIN_CONFIDENCE,
         help="Drop samples below this aggregate landmark confidence",
     )
     parser.add_argument(
         "--gap-ms",
         type=_positive_float,
-        default=75.0,
+        default=POSE_PREP_GAP_MS,
         help="Split smoothing segments across timestamp gaps above this size",
     )
     parser.add_argument(
         "--median-window",
         type=_positive_odd_int,
-        default=5,
+        default=POSE_PREP_MEDIAN_WINDOW,
         help="Centered median window for removing isolated landmark jumps",
     )
     parser.add_argument(
         "--mean-window",
         type=_positive_odd_int,
-        default=5,
+        default=POSE_PREP_MEAN_WINDOW,
         help="Centered moving-average window for baseline jitter reduction",
     )
     parser.add_argument(
         "--min-segment-samples",
         type=int,
-        default=5,
+        default=POSE_PREP_MIN_SEGMENT_SAMPLES,
         help="Drop filtered contiguous segments shorter than this",
     )
     return parser.parse_args()
@@ -273,7 +282,7 @@ def load_archive(path: Path) -> dict[str, Any]:
     include_velocity = features.shape[1] == 48
     if "include_velocity" in metadata:
         include_velocity = bool(metadata["include_velocity"])
-    target_fps = float(metadata.get("target_fps", 30.0))
+    target_fps = float(metadata.get("target_fps", POSE_TARGET_FPS))
     if target_fps <= 0:
         raise ValueError(f"{path}: target_fps must be greater than zero")
 
