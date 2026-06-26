@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -7,21 +8,36 @@ import torch
 
 from eeg_encoding import (
     EegPoseModelConfig,
+    EegPoseVAE,
+    ReadinessMetrics,
     build_context_windows,
     format_training_report,
     load_model,
+    score_readiness,
+    set_trainable_scope,
+    should_commit_profile_update,
     train_model,
+    train_session_model,
+    trainable_parameter_names,
     transform_eeg_for_model,
+    transformed_eeg_band_lengths,
     transformed_eeg_feature_count,
+    trusted_calibration_mask,
 )
 from pose_encoding import PoseLatentFrame, PoseLatentStream
 from streaming.eeg import EegPacket, SignalStreamer
 from streaming import (
+    CalibrationOverlayState,
+    RegionScores,
     PoseLatentBuffer,
+    dummy_positions_for_block,
     collect_paired_frames,
     load_paired_arrays,
     pair_packet,
+    positions_from_feature_vector,
+    region_scores,
     save_paired_frames,
+    select_next_movement_block,
 )
 from streaming.records import PairedTrainingFrame
 
@@ -257,6 +273,13 @@ def test_eeg_encoding_wavelet_transform_uses_fixed_packet_shape() -> None:
         wavelet_level=4,
         wavelet_mode="periodization",
     )
+    band_lengths = transformed_eeg_band_lengths(
+        n_samples=200,
+        use_wavelet=True,
+        wavelet="db4",
+        wavelet_level=4,
+        wavelet_mode="periodization",
+    )
     config = EegPoseModelConfig(
         n_channels=2,
         n_samples=200,
@@ -271,6 +294,7 @@ def test_eeg_encoding_wavelet_transform_uses_fixed_packet_shape() -> None:
     transformed = transform_eeg_for_model(raw_eeg, config)
 
     assert transformed.shape == (3, 2, 201)
+    assert band_lengths == (13, 13, 25, 50, 100)
     assert np.isfinite(transformed).all()
 
 
@@ -285,6 +309,318 @@ def test_eeg_context_windows_are_causal_and_padded() -> None:
     np.testing.assert_allclose(windows[0, 2], eeg_features[0])
     np.testing.assert_allclose(windows[2], eeg_features[:3])
     np.testing.assert_allclose(windows[3], eeg_features[1:4])
+
+
+def test_eeg_band_adapter_initializes_as_identity() -> None:
+    config = EegPoseModelConfig(
+        n_channels=2,
+        n_samples=200,
+        eeg_feature_count=201,
+        pose_latent_dim=3,
+        context_packet_count=2,
+        hidden_dim=16,
+        model_latent_dim=5,
+        wavelet_band_lengths=(13, 13, 25, 50, 100),
+    )
+    model = EegPoseVAE(config)
+    features = torch.randn(4, 2, 2, 201)
+
+    adapted = model.adapt_eeg_features(features)
+
+    torch.testing.assert_close(adapted, features)
+
+
+def test_eeg_band_adapter_changes_predictions_after_update() -> None:
+    config = EegPoseModelConfig(
+        n_channels=2,
+        n_samples=200,
+        eeg_feature_count=201,
+        pose_latent_dim=3,
+        context_packet_count=2,
+        hidden_dim=16,
+        model_latent_dim=5,
+        wavelet_band_lengths=(13, 13, 25, 50, 100),
+    )
+    model = EegPoseVAE(config)
+    features = torch.randn(4, 2, 2, 201)
+
+    with torch.no_grad():
+        before = model.predict_pose_latent(features)
+        model.band_adapter.scale[0, 0] = 1.5
+        model.band_adapter.bias[1, 2] = 0.25
+        after = model.predict_pose_latent(features)
+
+    assert not torch.allclose(before, after)
+
+
+def test_daily_recalibration_freezes_first_encoder_layer() -> None:
+    config = EegPoseModelConfig(
+        n_channels=2,
+        n_samples=200,
+        eeg_feature_count=201,
+        pose_latent_dim=3,
+        context_packet_count=2,
+        hidden_dim=16,
+        model_latent_dim=5,
+        wavelet_band_lengths=(13, 13, 25, 50, 100),
+    )
+    model = EegPoseVAE(config)
+
+    set_trainable_scope(model, "session")
+    trainable = trainable_parameter_names(model)
+
+    assert "band_adapter.scale" in trainable
+    assert "latent_mean.weight" in trainable
+    assert "latent_log_variance.weight" in trainable
+    assert "pose_head.weight" in trainable
+    assert "encoder.0.weight" not in trainable
+    assert "encoder.2.weight" not in trainable
+
+    set_trainable_scope(model, "session_deep")
+    trainable = trainable_parameter_names(model)
+
+    assert "encoder.0.weight" not in trainable
+    assert "encoder.2.weight" in trainable
+
+
+def test_session_update_does_not_mutate_base_model() -> None:
+    config = EegPoseModelConfig(
+        n_channels=2,
+        n_samples=200,
+        eeg_feature_count=201,
+        pose_latent_dim=3,
+        context_packet_count=2,
+        hidden_dim=16,
+        model_latent_dim=5,
+        wavelet_band_lengths=(13, 13, 25, 50, 100),
+    )
+    base_model = EegPoseVAE(config)
+    session_model = copy.deepcopy(base_model)
+    base_state = {
+        name: value.detach().clone()
+        for name, value in base_model.state_dict().items()
+    }
+    set_trainable_scope(session_model, "session")
+    optimizer = torch.optim.Adam(
+        [p for p in session_model.parameters() if p.requires_grad],
+        lr=1e-2,
+    )
+    features = torch.randn(4, 2, 2, 201)
+    target = torch.randn(4, 3)
+
+    predicted = session_model.predict_pose_latent(features)
+    loss = torch.nn.functional.smooth_l1_loss(predicted, target)
+    loss.backward()
+    optimizer.step()
+
+    for name, value in base_model.state_dict().items():
+        torch.testing.assert_close(value, base_state[name])
+
+
+def test_fake_daily_recalibration_saves_session_model() -> None:
+    data_path = output_path("session_calibration_paired.npz")
+    base_model_path = output_path("session_base.pt")
+    profiles_root = output_path("profiles")
+    rng = np.random.default_rng(21)
+    eeg = rng.normal(size=(8, 2, 200)).astype(np.float32)
+    pose_latent = rng.normal(size=(8, 3)).astype(np.float32)
+    np.savez_compressed(
+        data_path,
+        eeg=eeg,
+        pose_latent=pose_latent,
+        pose_confidence=np.full(8, 0.9, dtype=np.float32),
+        interpolation_confidence=np.full(8, 0.9, dtype=np.float32),
+        pose_reconstruction_error=np.full(8, 0.05, dtype=np.float32),
+    )
+    train_model(
+        data_path,
+        base_model_path,
+        epochs=1,
+        batch_size=4,
+        hidden_dim=16,
+        model_latent_dim=5,
+        pose_checkpoint=None,
+    )
+
+    report = train_session_model(
+        user_id="test_user",
+        base_checkpoint=base_model_path,
+        calibration_data=data_path,
+        session_id="test_session",
+        profiles_root=profiles_root,
+        epochs=1,
+        batch_size=4,
+        learning_rate=1e-3,
+        pose_checkpoint=None,
+    )
+
+    assert report.adaptation_mode == "session"
+    assert (
+        profiles_root
+        / "test_user"
+        / "sessions"
+        / "test_session"
+        / "session_model.pt"
+    ).exists()
+
+
+def test_profile_commit_rejects_regressed_metrics() -> None:
+    old_metrics = {
+        "validation_pose_mae": 0.3,
+        "stationary_false_positive_score": 0.2,
+        "movement_response_score": 0.7,
+    }
+
+    assert not should_commit_profile_update(
+        old_metrics,
+        {
+            "validation_pose_mae": 0.35,
+            "stationary_false_positive_score": 0.2,
+            "movement_response_score": 0.7,
+        },
+    )
+    assert should_commit_profile_update(
+        old_metrics,
+        {
+            "validation_pose_mae": 0.25,
+            "stationary_false_positive_score": 0.15,
+            "movement_response_score": 0.75,
+        },
+    )
+
+
+def test_low_confidence_pose_labels_pause_calibration_learning() -> None:
+    archive = {
+        "pose_confidence": np.asarray([0.9, 0.4, 0.8], dtype=np.float32),
+        "interpolation_confidence": np.asarray([0.8, 0.8, 0.2], dtype=np.float32),
+        "pose_reconstruction_error": np.asarray([0.05, 0.05, 0.05], dtype=np.float32),
+    }
+
+    mask = trusted_calibration_mask(archive)
+
+    np.testing.assert_array_equal(mask, np.asarray([True, False, False]))
+
+
+def test_readiness_requires_eeg_model_metrics() -> None:
+    result = score_readiness(
+        ReadinessMetrics(
+            trusted_sample_count=100,
+            mean_pose_confidence=1.0,
+            mean_interpolation_confidence=1.0,
+            mean_pose_reconstruction_error=0.0,
+        )
+    )
+
+    assert result.score == 0.0
+    assert result.ready is False
+
+
+def test_readiness_label_quality_is_only_a_gate_not_score_boost() -> None:
+    clean_labels = ReadinessMetrics(
+        trusted_sample_count=100,
+        mean_pose_confidence=1.0,
+        mean_interpolation_confidence=1.0,
+        mean_pose_reconstruction_error=0.0,
+        decoded_pose_error=0.02,
+        stationary_false_positive_score=0.0,
+        movement_response_score=0.8,
+    )
+    poor_label_summary = ReadinessMetrics(
+        trusted_sample_count=100,
+        mean_pose_confidence=0.0,
+        mean_interpolation_confidence=0.0,
+        mean_pose_reconstruction_error=10.0,
+        decoded_pose_error=0.02,
+        stationary_false_positive_score=0.0,
+        movement_response_score=0.8,
+    )
+
+    clean_result = score_readiness(clean_labels)
+    poor_label_result = score_readiness(poor_label_summary)
+
+    assert clean_result.score == poor_label_result.score
+    assert clean_result.ready == poor_label_result.ready
+
+
+def test_readiness_requires_enough_trusted_samples() -> None:
+    result = score_readiness(
+        ReadinessMetrics(
+            trusted_sample_count=1,
+            mean_pose_confidence=1.0,
+            mean_interpolation_confidence=1.0,
+            mean_pose_reconstruction_error=0.0,
+            decoded_pose_error=0.0,
+            stationary_false_positive_score=0.0,
+            movement_response_score=1.0,
+        )
+    )
+
+    assert result.score >= 0.8
+    assert result.ready is False
+
+
+def test_calibration_positions_and_region_scores_target_weak_area() -> None:
+    truth = np.zeros((8, 3), dtype=np.float32)
+    predicted = truth.copy()
+    predicted[[0, 2, 4], 0] = 1.0
+
+    scores = region_scores(truth, predicted)
+    block = select_next_movement_block(scores)
+
+    assert scores.left_arm > scores.right_arm
+    assert block.region == "left_arm"
+
+
+def test_dummy_calibration_motion_changes_target_pose() -> None:
+    start = dummy_positions_for_block("left_arm_raise", elapsed_s=0.0, duration_s=4.0)
+    mid = dummy_positions_for_block("left_arm_raise", elapsed_s=2.0, duration_s=4.0)
+
+    assert mid[4, 1] < start[4, 1]
+
+
+def test_positions_from_feature_vector_uses_position_features_only() -> None:
+    vector = np.arange(48, dtype=np.float32)
+
+    positions = positions_from_feature_vector(vector)
+
+    assert positions.shape == (8, 3)
+    np.testing.assert_allclose(positions.reshape(-1), np.arange(24, dtype=np.float32))
+
+
+def test_calibration_overlay_renders_truth_dummy_and_eeg_layers() -> None:
+    class FakeCv2:
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.lines = []
+            self.circles = []
+            self.weights = []
+
+        def line(self, *args, **kwargs) -> None:
+            self.lines.append((args, kwargs))
+
+        def circle(self, *args, **kwargs) -> None:
+            self.circles.append((args, kwargs))
+
+        def addWeighted(self, overlay, alpha, frame, beta, gamma, dst) -> None:
+            self.weights.append(alpha)
+            dst[:] = overlay
+
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    overlay = CalibrationOverlayState()
+    truth = np.zeros(48, dtype=np.float32)
+    eeg = np.zeros(48, dtype=np.float32)
+    eeg[0] = 1.0
+    overlay.update_truth(truth)
+    overlay.update_eeg(eeg)
+    overlay.update_dummy(select_next_movement_block(RegionScores(1, 0, 0, 0, 0, 0)), 0.5)
+    cv2 = FakeCv2()
+
+    overlay.render(frame, cv2, pose_result=None, mirror_x=False)
+
+    assert cv2.lines
+    assert cv2.circles
+    assert cv2.weights
 
 
 def test_pose_encoding_exports_public_wrapper() -> None:

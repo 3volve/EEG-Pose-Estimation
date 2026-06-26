@@ -8,7 +8,7 @@ from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread, current_thread
 import time
 from types import ModuleType
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 import warnings
 
 from config import POSE_CAMERA_INDEX, POSE_RESULT_QUEUE_SIZE, POSE_TARGET_FPS
@@ -47,6 +47,7 @@ class AsyncPoseEstimator:
         result_queue_size: int = POSE_RESULT_QUEUE_SIZE,
         mirror_frame: bool = False,
         draw_preview: bool = False,
+        preview_renderer: Callable[[Any, ModuleType, PoseResult | None, bool], None] | None = None,
     ) -> None:
         if target_fps <= 0:
             raise ValueError("target_fps must be greater than zero")
@@ -58,6 +59,7 @@ class AsyncPoseEstimator:
         self.target_fps = target_fps
         self.mirror_frame = mirror_frame
         self.draw_preview = draw_preview
+        self.preview_renderer = preview_renderer
 
         self._results: Queue[PoseResult] = Queue(maxsize=result_queue_size)
         self._latest: PoseResult | None = None
@@ -224,9 +226,6 @@ class AsyncPoseEstimator:
                 self._stop_event.set()
                 break
 
-            if self.mirror_frame:
-                frame = self._cv2.flip(frame, 1)
-
             rgb_frame = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
             mp_image = self._mp.Image(
                 image_format=self._mp.ImageFormat.SRGB,
@@ -240,8 +239,25 @@ class AsyncPoseEstimator:
             self._landmarker.detect_async(mp_image, timestamp_ms)
 
             if self.draw_preview:
-                self._draw_pose_overlay(frame, self.get_latest())
-                self._cv2.imshow(self._PREVIEW_WINDOW, frame)
+                preview_frame = (
+                    self._cv2.flip(frame, 1)
+                    if self.mirror_frame
+                    else frame.copy()
+                )
+                result = self.get_latest()
+                self._draw_pose_overlay(
+                    preview_frame,
+                    result,
+                    mirror_x=self.mirror_frame,
+                )
+                if self.preview_renderer is not None:
+                    self.preview_renderer(
+                        preview_frame,
+                        self._cv2,
+                        result,
+                        self.mirror_frame,
+                    )
+                self._cv2.imshow(self._PREVIEW_WINDOW, preview_frame)
                 self._preview_created = True
                 if self._cv2.waitKey(1) & 0xFF == ord("q"):
                     self._stop_event.set()
@@ -255,6 +271,8 @@ class AsyncPoseEstimator:
         self,
         frame: Any,
         result: PoseResult | None,
+        *,
+        mirror_x: bool = False,
     ) -> None:
         if result is None or not result.pose_detected:
             return
@@ -262,7 +280,10 @@ class AsyncPoseEstimator:
         assert self._cv2 is not None
         height, width = frame.shape[:2]
         points = [
-            (round(landmark.x * width), round(landmark.y * height))
+            (
+                round((1.0 - landmark.x if mirror_x else landmark.x) * width),
+                round(landmark.y * height),
+            )
             for landmark in result.landmarks
         ]
 

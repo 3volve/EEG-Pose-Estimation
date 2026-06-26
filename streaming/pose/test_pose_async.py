@@ -104,6 +104,36 @@ def test_preview_draws_landmarks_and_connections() -> None:
     assert len(estimator._cv2.circles) == 2
 
 
+def test_preview_draws_mirrored_landmarks_without_mutating_result() -> None:
+    class FakeCv2:
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.lines = []
+            self.circles = []
+
+        def line(self, *args, **kwargs) -> None:
+            self.lines.append((args, kwargs))
+
+        def circle(self, *args, **kwargs) -> None:
+            self.circles.append((args, kwargs))
+
+    estimator = AsyncPoseEstimator("unused.task")
+    estimator._cv2 = FakeCv2()
+    estimator._pose_connections = ((0, 1),)
+    frame = SimpleNamespace(shape=(100, 200, 3))
+    landmarks = [
+        PoseLandmark(0.25, 0.5, 0.0, 1.0, 1.0),
+        PoseLandmark(0.75, 0.25, 0.0, 1.0, 1.0),
+    ]
+    result = PoseResult(1, 1.0, 200, 100, landmarks, [], True)
+
+    estimator._draw_pose_overlay(frame, result, mirror_x=True)
+
+    assert estimator._cv2.lines[0][0][1:3] == ((150, 50), (50, 25))
+    assert result.landmarks[0].x == 0.25
+
+
 @pytest.mark.parametrize(
     ("argument", "value"),
     [("target_fps", 0), ("result_queue_size", 0)],

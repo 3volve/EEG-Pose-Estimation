@@ -24,6 +24,7 @@ from config import (
     EEG_MODEL_RECONSTRUCTION_WEIGHT,
     EEG_MODEL_SEED,
     EEG_MODEL_VAL_SPLIT,
+    EEG_USE_BAND_ADAPTER,
     EEG_POSITION_LANDMARK_WEIGHTS,
     EEG_STANDARDIZE_POSE_LATENTS,
     EEG_STILLNESS_ALLOWED_PREDICTED_VELOCITY,
@@ -35,6 +36,11 @@ from config import (
     EEG_WAVELET_LEVEL,
     EEG_WAVELET_MODE,
     EEG_WAVELET_STANDARDIZE_INPUT,
+    EEG_ADAPTATION_MODE_PROFILE_ENCODER,
+    EEG_ADAPTATION_MODE_PROFILE_FULL,
+    EEG_ADAPTATION_MODE_PROFILE_HEAD,
+    EEG_ADAPTATION_MODE_SESSION,
+    EEG_ADAPTATION_MODE_SESSION_DEEP,
     POSE_ENCODING_MODEL,
 )
 from streaming.eeg import EegPacket
@@ -61,6 +67,8 @@ class EegPoseModelConfig:
     wavelet_level: int = EEG_WAVELET_LEVEL
     wavelet_mode: str = EEG_WAVELET_MODE
     standardize_input: bool = EEG_WAVELET_STANDARDIZE_INPUT
+    use_band_adapter: bool = EEG_USE_BAND_ADAPTER
+    wavelet_band_lengths: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,8 +99,39 @@ class EegTrainingReport:
     decoded_position_weight: float
     decoded_velocity_weight: float
     stillness_weight: float
+    adaptation_mode: str | None
     train: EegTrainingSplitReport
     validation: EegTrainingSplitReport | None
+
+
+class EegBandAdapter(nn.Module):
+    """Per-channel, per-wavelet-band affine adapter for calibration drift."""
+
+    def __init__(self, n_channels: int, band_lengths: tuple[int, ...]) -> None:
+        super().__init__()
+        self.n_channels = n_channels
+        self.band_lengths = band_lengths
+        self.scale = nn.Parameter(torch.ones(n_channels, len(band_lengths)))
+        self.bias = nn.Parameter(torch.zeros(n_channels, len(band_lengths)))
+
+    def forward(self, features: Tensor) -> Tensor:
+        assert features.ndim in (3, 4)
+        adapted_chunks = []
+        start = 0
+        for band_index, band_length in enumerate(self.band_lengths):
+            stop = start + band_length
+            chunk = features[..., start:stop]
+            if features.ndim == 3:
+                scale = self.scale[:, band_index].view(1, -1, 1)
+                bias = self.bias[:, band_index].view(1, -1, 1)
+                adapted_chunks.append(chunk * scale + bias)
+            else:
+                scale = self.scale[:, band_index].view(1, 1, -1, 1)
+                bias = self.bias[:, band_index].view(1, 1, -1, 1)
+                adapted_chunks.append(chunk * scale + bias)
+            start = stop
+        assert start == features.shape[-1]
+        return torch.cat(adapted_chunks, dim=-1)
 
 
 class EegPoseVAE(nn.Module):
@@ -101,6 +140,12 @@ class EegPoseVAE(nn.Module):
     def __init__(self, config: EegPoseModelConfig) -> None:
         super().__init__()
         self.config = config
+        band_lengths = config.wavelet_band_lengths or (config.eeg_feature_count,)
+        self.band_adapter = (
+            EegBandAdapter(config.n_channels, band_lengths)
+            if config.use_band_adapter
+            else nn.Identity()
+        )
         input_dim = (
             config.context_packet_count
             * config.n_channels
@@ -124,22 +169,81 @@ class EegPoseVAE(nn.Module):
             nn.Linear(config.hidden_dim, input_dim),
         )
 
+    def adapt_eeg_features(self, eeg_features: Tensor) -> Tensor:
+        return self.band_adapter(eeg_features)
+
     def forward(self, eeg_features: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        flat = eeg_features.flatten(start_dim=1)
+        adapted_features = self.adapt_eeg_features(eeg_features)
+        flat = adapted_features.flatten(start_dim=1)
         hidden = self.encoder(flat)
         mean = self.latent_mean(hidden)
         log_variance = torch.clamp(self.latent_log_variance(hidden), -12.0, 8.0)
         std = torch.exp(0.5 * log_variance)
         z = mean + std * torch.randn_like(std)
         pose_latent = self.pose_head(z)
-        reconstruction = self.decoder(z).reshape_as(eeg_features)
+        reconstruction = self.decoder(z).reshape_as(adapted_features)
         return pose_latent, reconstruction, mean, log_variance
 
     def predict_pose_latent(self, eeg_features: Tensor) -> Tensor:
-        flat = eeg_features.flatten(start_dim=1)
+        adapted_features = self.adapt_eeg_features(eeg_features)
+        flat = adapted_features.flatten(start_dim=1)
         hidden = self.encoder(flat)
         mean = self.latent_mean(hidden)
         return self.pose_head(mean)
+
+
+def set_trainable_scope(model: EegPoseVAE, mode: str | None) -> None:
+    if mode is None:
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+        return
+
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    _set_module_trainable(model.band_adapter, True)
+    _set_module_trainable(model.latent_mean, True)
+    _set_module_trainable(model.latent_log_variance, True)
+    _set_module_trainable(model.pose_head, True)
+
+    if mode == EEG_ADAPTATION_MODE_SESSION_DEEP:
+        _set_encoder_linear_trainable(model, linear_index=1, trainable=True)
+    elif mode == EEG_ADAPTATION_MODE_PROFILE_ENCODER:
+        _set_module_trainable(model.encoder, True)
+    elif mode == EEG_ADAPTATION_MODE_PROFILE_FULL:
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+    elif mode == EEG_ADAPTATION_MODE_PROFILE_HEAD:
+        pass
+    elif mode == EEG_ADAPTATION_MODE_SESSION:
+        pass
+    else:
+        raise ValueError(f"Unknown EEG adaptation mode: {mode}")
+
+
+def trainable_parameter_names(model: EegPoseVAE) -> tuple[str, ...]:
+    return tuple(name for name, parameter in model.named_parameters() if parameter.requires_grad)
+
+
+def _set_module_trainable(module: nn.Module, trainable: bool) -> None:
+    for parameter in module.parameters():
+        parameter.requires_grad_(trainable)
+
+
+def _set_encoder_linear_trainable(
+    model: EegPoseVAE,
+    *,
+    linear_index: int,
+    trainable: bool,
+) -> None:
+    seen = 0
+    for module in model.encoder:
+        if isinstance(module, nn.Linear):
+            if seen == linear_index:
+                _set_module_trainable(module, trainable)
+                return
+            seen += 1
+    raise AssertionError(f"Encoder does not have linear layer index {linear_index}")
 
 
 class EegPosePredictor:
@@ -237,6 +341,28 @@ def transformed_eeg_feature_count(
         level=wavelet_level,
     )
     return sum(len(coefficient) for coefficient in coefficients)
+
+
+def transformed_eeg_band_lengths(
+    *,
+    n_samples: int,
+    use_wavelet: bool,
+    wavelet: str,
+    wavelet_level: int,
+    wavelet_mode: str,
+) -> tuple[int, ...]:
+    if not use_wavelet:
+        return (n_samples,)
+
+    import pywt
+
+    coefficients = pywt.wavedec(
+        np.zeros(n_samples, dtype=np.float32),
+        wavelet,
+        mode=wavelet_mode,
+        level=wavelet_level,
+    )
+    return tuple(len(coefficient) for coefficient in coefficients)
 
 
 def context_from_history(
@@ -427,6 +553,8 @@ def train_model(
     wavelet_level: int = EEG_WAVELET_LEVEL,
     wavelet_mode: str = EEG_WAVELET_MODE,
     standardize_input: bool = EEG_WAVELET_STANDARDIZE_INPUT,
+    use_band_adapter: bool = EEG_USE_BAND_ADAPTER,
+    adaptation_mode: str | None = None,
     device: str | torch.device = DEFAULT_DEVICE,
     seed: int = EEG_MODEL_SEED,
     val_split: float = EEG_MODEL_VAL_SPLIT,
@@ -471,6 +599,13 @@ def train_model(
             wavelet_level=wavelet_level,
             wavelet_mode=wavelet_mode,
         )
+        band_lengths = transformed_eeg_band_lengths(
+            n_samples=raw_eeg.shape[2],
+            use_wavelet=True,
+            wavelet=wavelet,
+            wavelet_level=wavelet_level,
+            wavelet_mode=wavelet_mode,
+        )
         config = EegPoseModelConfig(
             n_channels=raw_eeg.shape[1],
             n_samples=raw_eeg.shape[2],
@@ -503,6 +638,8 @@ def train_model(
             wavelet_level=wavelet_level,
             wavelet_mode=wavelet_mode,
             standardize_input=standardize_input,
+            use_band_adapter=use_band_adapter,
+            wavelet_band_lengths=band_lengths,
         )
         model = EegPoseVAE(config).to(device)
     else:
@@ -542,7 +679,12 @@ def train_model(
         device=device,
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    set_trainable_scope(model, adaptation_mode)
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    assert trainable_parameters
+    optimizer = torch.optim.Adam(trainable_parameters, lr=learning_rate)
     loss_fn = nn.SmoothL1Loss()
     data = TensorDataset(
         torch.from_numpy(eeg[train_indices]),
@@ -565,7 +707,11 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
             predicted, reconstruction, mean, log_variance = model(batch_eeg)
             prediction_loss = loss_fn(predicted, batch_pose_latent_target)
-            reconstruction_loss = nn.functional.mse_loss(reconstruction, batch_eeg)
+            reconstruction_target = model.adapt_eeg_features(batch_eeg).detach()
+            reconstruction_loss = nn.functional.mse_loss(
+                reconstruction,
+                reconstruction_target,
+            )
             predicted_raw = unstandardize_pose_latents(predicted, config)
             decoded_loss = (
                 decoded_pose_training_loss(
@@ -634,6 +780,7 @@ def train_model(
         decoded_position_weight=decoded_position_weight if pose_decoder is not None else 0.0,
         decoded_velocity_weight=decoded_velocity_weight if pose_decoder is not None else 0.0,
         stillness_weight=stillness_weight if pose_decoder is not None else 0.0,
+        adaptation_mode=adaptation_mode,
         train=train_report,
         validation=validation_report,
     )
@@ -665,6 +812,8 @@ def save_model(path: str | Path, model: EegPoseVAE) -> None:
                 "wavelet_level": config.wavelet_level,
                 "wavelet_mode": config.wavelet_mode,
                 "standardize_input": config.standardize_input,
+                "use_band_adapter": config.use_band_adapter,
+                "wavelet_band_lengths": config.wavelet_band_lengths,
             },
         },
         output_path,
@@ -781,6 +930,7 @@ def _evaluate_split(
         ).cpu().numpy()
         _, reconstruction, mean, log_variance = model(eeg_tensor)
         reconstruction_np = reconstruction.cpu().numpy()
+        reconstruction_target = model.adapt_eeg_features(eeg_tensor).cpu().numpy()
         kl_loss = -0.5 * torch.mean(
             1.0 + log_variance - mean.pow(2) - log_variance.exp()
         )
@@ -812,7 +962,9 @@ def _evaluate_split(
             else 0.0
         ),
         cosine_similarity=cosine_similarity,
-        eeg_reconstruction_mse=float(np.mean((reconstruction_np - eeg) ** 2)),
+        eeg_reconstruction_mse=float(
+            np.mean((reconstruction_np - reconstruction_target) ** 2)
+        ),
         kl_loss=float(kl_loss.cpu()),
     )
 
@@ -827,6 +979,8 @@ def format_training_report(report: EegTrainingReport) -> str:
         lines.append(f"  initialized from: {report.checkpoint_path}")
     if report.pose_checkpoint_path is not None:
         lines.append(f"  pose decoder: {report.pose_checkpoint_path}")
+    if report.adaptation_mode is not None:
+        lines.append(f"  adaptation_mode: {report.adaptation_mode}")
     lines.extend(
         [
             f"  epochs: {report.epochs}",
