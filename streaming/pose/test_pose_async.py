@@ -134,6 +134,40 @@ def test_preview_draws_mirrored_landmarks_without_mutating_result() -> None:
     assert result.landmarks[0].x == 0.25
 
 
+def test_preview_frame_mirrors_image_when_enabled() -> None:
+    class FakeCv2:
+        def __init__(self) -> None:
+            self.flipped = False
+
+        def flip(self, frame, axis):
+            self.flipped = True
+            assert axis == 1
+            return "mirrored"
+
+    estimator = AsyncPoseEstimator("unused.task", mirror_frame=True)
+    estimator._cv2 = FakeCv2()
+
+    assert estimator._preview_frame("raw") == "mirrored"
+    assert estimator._cv2.flipped is True
+
+
+def test_preview_frame_copies_image_when_not_mirrored() -> None:
+    class FakeFrame:
+        def __init__(self) -> None:
+            self.copied = False
+
+        def copy(self):
+            self.copied = True
+            return "copy"
+
+    estimator = AsyncPoseEstimator("unused.task", mirror_frame=False)
+    estimator._cv2 = object()
+    frame = FakeFrame()
+
+    assert estimator._preview_frame(frame) == "copy"
+    assert frame.copied is True
+
+
 @pytest.mark.parametrize(
     ("argument", "value"),
     [("target_fps", 0), ("result_queue_size", 0)],

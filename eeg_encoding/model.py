@@ -36,6 +36,9 @@ from config import (
     EEG_WAVELET_LEVEL,
     EEG_WAVELET_MODE,
     EEG_WAVELET_STANDARDIZE_INPUT,
+    EEG_ADAPTATION_MODE_ADAPTER_HEAD,
+    EEG_ADAPTATION_MODE_ADAPTER_ONLY,
+    EEG_ADAPTATION_MODE_PROFILE_CORE,
     EEG_ADAPTATION_MODE_PROFILE_ENCODER,
     EEG_ADAPTATION_MODE_PROFILE_FULL,
     EEG_ADAPTATION_MODE_PROFILE_HEAD,
@@ -201,7 +204,22 @@ def set_trainable_scope(model: EegPoseVAE, mode: str | None) -> None:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
+    if mode == EEG_ADAPTATION_MODE_PROFILE_CORE:
+        _set_module_trainable(model.encoder, True)
+        _set_module_trainable(model.latent_mean, True)
+        _set_module_trainable(model.latent_log_variance, True)
+        _set_module_trainable(model.pose_head, True)
+        return
+
     _set_module_trainable(model.band_adapter, True)
+
+    if mode == EEG_ADAPTATION_MODE_ADAPTER_ONLY:
+        return
+
+    if mode == EEG_ADAPTATION_MODE_ADAPTER_HEAD:
+        _set_module_trainable(model.pose_head, True)
+        return
+
     _set_module_trainable(model.latent_mean, True)
     _set_module_trainable(model.latent_log_variance, True)
     _set_module_trainable(model.pose_head, True)
@@ -223,6 +241,13 @@ def set_trainable_scope(model: EegPoseVAE, mode: str | None) -> None:
 
 def trainable_parameter_names(model: EegPoseVAE) -> tuple[str, ...]:
     return tuple(name for name, parameter in model.named_parameters() if parameter.requires_grad)
+
+
+def reset_band_adapter_identity(model: EegPoseVAE) -> None:
+    if isinstance(model.band_adapter, EegBandAdapter):
+        with torch.no_grad():
+            model.band_adapter.scale.fill_(1.0)
+            model.band_adapter.bias.zero_()
 
 
 def _set_module_trainable(module: nn.Module, trainable: bool) -> None:

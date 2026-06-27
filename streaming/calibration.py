@@ -21,6 +21,7 @@ UPPER_BODY_NAMES: tuple[str, ...] = (
     "left_hip",
     "right_hip",
 )
+UPPER_BODY_LANDMARK_IDS: tuple[int, ...] = (11, 12, 13, 14, 15, 16, 23, 24)
 UPPER_BODY_BONES: tuple[tuple[int, int], ...] = (
     (0, 1),
     (0, 2),
@@ -58,6 +59,16 @@ class RegionScores:
     movement_response: float
 
 
+@dataclass(frozen=True, slots=True)
+class CalibrationDisplayStatus:
+    readiness_score: float
+    ready: bool
+    trusted_samples: int
+    skipped_samples: int
+    update_count: int
+    latest_loss: float | None = None
+
+
 DEFAULT_CALIBRATION_BLOCKS: tuple[CalibrationMovementBlock, ...] = (
     CalibrationMovementBlock("rest", "rest", 4.0, rest=True),
     CalibrationMovementBlock("left_arm_raise", "left_arm", 6.0),
@@ -78,12 +89,12 @@ def positions_from_feature_vector(
 def neutral_dummy_positions() -> NDArray[np.float32]:
     return np.asarray(
         [
-            [-0.5, -1.0, 0.0],
-            [0.5, -1.0, 0.0],
-            [-0.85, -0.45, 0.0],
-            [0.85, -0.45, 0.0],
-            [-0.95, 0.15, 0.0],
-            [0.95, 0.15, 0.0],
+            [-0.5, -1.55, 0.0],
+            [0.5, -1.55, 0.0],
+            [-0.9, -0.9, 0.0],
+            [0.9, -0.9, 0.0],
+            [-1.05, -0.2, 0.0],
+            [1.05, -0.2, 0.0],
             [-0.4, 0.0, 0.0],
             [0.4, 0.0, 0.0],
         ],
@@ -100,11 +111,11 @@ def dummy_positions_for_block(
     phase = _smooth_phase(elapsed_s, duration_s)
 
     if block_name == "left_arm_raise":
-        positions[2] += np.asarray([-0.15, -0.65 * phase, 0.0], dtype=np.float32)
-        positions[4] += np.asarray([-0.1, -1.25 * phase, 0.0], dtype=np.float32)
+        positions[2] += np.asarray([-0.12, -0.75 * phase, 0.0], dtype=np.float32)
+        positions[4] += np.asarray([-0.06, -1.35 * phase, 0.0], dtype=np.float32)
     elif block_name == "right_arm_raise":
-        positions[3] += np.asarray([0.15, -0.65 * phase, 0.0], dtype=np.float32)
-        positions[5] += np.asarray([0.1, -1.25 * phase, 0.0], dtype=np.float32)
+        positions[3] += np.asarray([0.12, -0.75 * phase, 0.0], dtype=np.float32)
+        positions[5] += np.asarray([0.06, -1.35 * phase, 0.0], dtype=np.float32)
     elif block_name == "elbow_bends":
         bend = np.sin(2.0 * np.pi * _cycle(elapsed_s, duration_s))
         positions[4] += np.asarray([0.25 * bend, -0.35 * abs(bend), 0.0], dtype=np.float32)
@@ -184,12 +195,19 @@ def select_next_movement_block(
 
 
 class CalibrationOverlayState:
-    def __init__(self, *, error_scale: float = 0.75) -> None:
+    def __init__(
+        self,
+        *,
+        error_scale: float = 0.75,
+        eeg_display_smoothing: float = 0.7,
+    ) -> None:
         self.error_scale = error_scale
+        self.eeg_display_smoothing = eeg_display_smoothing
         self._lock = Lock()
         self._truth_positions: NDArray[np.float32] | None = None
         self._eeg_positions: NDArray[np.float32] | None = None
         self._dummy_positions: NDArray[np.float32] | None = None
+        self._status: CalibrationDisplayStatus | None = None
 
     def update_truth(self, feature_vector: NDArray[np.float32]) -> None:
         with self._lock:
@@ -197,7 +215,14 @@ class CalibrationOverlayState:
 
     def update_eeg(self, decoded_feature_vector: NDArray[np.float32]) -> None:
         with self._lock:
-            self._eeg_positions = positions_from_feature_vector(decoded_feature_vector)
+            latest = positions_from_feature_vector(decoded_feature_vector)
+            if self._eeg_positions is None:
+                self._eeg_positions = latest
+            else:
+                alpha = self.eeg_display_smoothing
+                self._eeg_positions = (
+                    alpha * latest + (1.0 - alpha) * self._eeg_positions
+                ).astype(np.float32, copy=False)
 
     def update_dummy(
         self,
@@ -211,6 +236,10 @@ class CalibrationOverlayState:
                 block.duration_s,
             )
 
+    def update_status(self, status: CalibrationDisplayStatus) -> None:
+        with self._lock:
+            self._status = status
+
     def render(
         self,
         frame: Any,
@@ -222,17 +251,21 @@ class CalibrationOverlayState:
             truth = None if self._truth_positions is None else self._truth_positions.copy()
             eeg = None if self._eeg_positions is None else self._eeg_positions.copy()
             dummy = None if self._dummy_positions is None else self._dummy_positions.copy()
+            status = self._status
 
-        anchor = _display_anchor(frame, pose_result, mirror_x)
+        anchor = _display_anchor(frame, pose_result, mirror_x, truth)
+        if dummy is not None and truth is not None:
+            dummy = _fit_dummy_to_truth(dummy, truth)
         if dummy is not None:
             _draw_plain_skeleton(
                 frame,
                 cv2,
                 dummy,
                 anchor,
-                color=(255, 180, 40),
-                alpha=0.35,
-                thickness=2,
+                mirror_x=mirror_x,
+                color=(255, 40, 230),
+                alpha=0.7,
+                thickness=4,
             )
         if truth is not None:
             _draw_plain_skeleton(
@@ -240,6 +273,7 @@ class CalibrationOverlayState:
                 cv2,
                 truth,
                 anchor,
+                mirror_x=mirror_x,
                 color=(40, 230, 40),
                 alpha=0.9,
                 thickness=3,
@@ -251,19 +285,34 @@ class CalibrationOverlayState:
                 eeg,
                 truth,
                 anchor,
+                mirror_x=mirror_x,
                 error_scale=self.error_scale,
             )
+        if status is not None:
+            _draw_readiness_bar(frame, cv2, status)
 
 
 def _display_anchor(
     frame: Any,
     pose_result: PoseResult | None,
     mirror_x: bool,
+    reference_positions: NDArray[np.float32] | None = None,
 ) -> tuple[float, float, float]:
     height, width = frame.shape[:2]
     default_scale = min(width, height) * 0.16
     if pose_result is None or not pose_result.pose_detected or not pose_result.landmarks:
         return width * 0.5, height * 0.68, default_scale
+
+    if reference_positions is not None:
+        fitted = _fit_display_anchor_to_image_landmarks(
+            reference_positions,
+            pose_result,
+            width=width,
+            height=height,
+            mirror_x=mirror_x,
+        )
+        if fitted is not None:
+            return fitted
 
     points = []
     for landmark_index in (11, 12, 23, 24):
@@ -279,13 +328,64 @@ def _display_anchor(
     return float(root[0]), float(root[1]), scale
 
 
+def _fit_display_anchor_to_image_landmarks(
+    positions: NDArray[np.float32],
+    pose_result: PoseResult,
+    *,
+    width: int,
+    height: int,
+    mirror_x: bool,
+) -> tuple[float, float, float] | None:
+    source_points = []
+    target_points = []
+    for local_index, landmark_index in enumerate(UPPER_BODY_LANDMARK_IDS):
+        if landmark_index >= len(pose_result.landmarks):
+            return None
+        landmark = pose_result.landmarks[landmark_index]
+        if landmark.x is None or landmark.y is None:
+            continue
+        source_x = -positions[local_index, 0] if mirror_x else positions[local_index, 0]
+        source_points.append([source_x, positions[local_index, 1]])
+        target_x = (1.0 - landmark.x if mirror_x else landmark.x) * width
+        target_points.append([target_x, landmark.y * height])
+
+    if len(source_points) < 4:
+        return None
+
+    source = np.asarray(source_points, dtype=np.float32)
+    target = np.asarray(target_points, dtype=np.float32)
+    source_centered = source - source.mean(axis=0, keepdims=True)
+    target_centered = target - target.mean(axis=0, keepdims=True)
+    denominator = float(np.sum(source_centered * source_centered))
+    if denominator <= 1e-6:
+        return None
+    scale = float(np.sum(source_centered * target_centered) / denominator)
+    if not np.isfinite(scale) or scale <= 1.0:
+        return None
+    offset = target.mean(axis=0) - scale * source.mean(axis=0)
+    return float(offset[0]), float(offset[1]), scale
+
+
+def _fit_dummy_to_truth(
+    dummy_positions: NDArray[np.float32],
+    truth_positions: NDArray[np.float32],
+) -> NDArray[np.float32]:
+    neutral = neutral_dummy_positions()
+    movement_delta = dummy_positions - neutral
+    return (truth_positions + movement_delta).astype(np.float32, copy=False)
+
+
 def _points(
     positions: NDArray[np.float32],
     anchor: tuple[float, float, float],
+    mirror_x: bool,
 ) -> list[tuple[int, int]]:
     root_x, root_y, scale = anchor
     return [
-        (round(root_x + float(position[0]) * scale), round(root_y + float(position[1]) * scale))
+        (
+            round(root_x + (-float(position[0]) if mirror_x else float(position[0])) * scale),
+            round(root_y + float(position[1]) * scale),
+        )
         for position in positions
     ]
 
@@ -296,12 +396,13 @@ def _draw_plain_skeleton(
     positions: NDArray[np.float32],
     anchor: tuple[float, float, float],
     *,
+    mirror_x: bool,
     color: tuple[int, int, int],
     alpha: float,
     thickness: int,
 ) -> None:
     overlay = frame.copy()
-    points = _points(positions, anchor)
+    points = _points(positions, anchor, mirror_x)
     for start, end in UPPER_BODY_BONES:
         cv2.line(
             overlay,
@@ -330,12 +431,13 @@ def _draw_error_skeleton(
     truth_positions: NDArray[np.float32],
     anchor: tuple[float, float, float],
     *,
+    mirror_x: bool,
     error_scale: float,
 ) -> None:
     errors = np.linalg.norm(eeg_positions - truth_positions, axis=1)
     normalized = np.clip(errors / error_scale, 0.0, 1.0)
     colors = [_error_color(value) for value in normalized]
-    points = _points(eeg_positions, anchor)
+    points = _points(eeg_positions, anchor, mirror_x)
 
     for start, end in UPPER_BODY_BONES:
         alpha = float(0.25 + 0.55 * max(normalized[start], normalized[end]))
@@ -361,6 +463,49 @@ def _draw_error_skeleton(
         )
         alpha = float(0.3 + 0.55 * value)
         cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, frame)
+
+
+def _draw_readiness_bar(
+    frame: Any,
+    cv2: ModuleType,
+    status: CalibrationDisplayStatus,
+) -> None:
+    height, width = frame.shape[:2]
+    margin = 18
+    bar_width = min(360, max(160, width - 2 * margin))
+    bar_height = 18
+    x0 = margin
+    y0 = margin
+    x1 = x0 + bar_width
+    y1 = y0 + bar_height
+    score = float(np.clip(status.readiness_score, 0.0, 1.0))
+    fill_x = round(x0 + bar_width * score)
+    fill_color = (40, 210, 60) if status.ready else (0, 180, 255)
+    if score < 0.5:
+        fill_color = (0, 70, 255)
+
+    cv2.rectangle(frame, (x0, y0), (x1, y1), color=(45, 45, 45), thickness=-1)
+    cv2.rectangle(frame, (x0, y0), (fill_x, y1), color=fill_color, thickness=-1)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), color=(235, 235, 235), thickness=1)
+
+    loss_text = "" if status.latest_loss is None else f" loss {status.latest_loss:.3f}"
+    text = (
+        f"readiness {score:.2f} "
+        f"{'READY' if status.ready else 'learning'} "
+        f"trusted {status.trusted_samples} "
+        f"updates {status.update_count}"
+        f"{loss_text}"
+    )
+    cv2.putText(
+        frame,
+        text,
+        (x0, y1 + 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (245, 245, 245),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def _draw_gradient_line(

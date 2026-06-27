@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -9,10 +10,15 @@ import torch
 from eeg_encoding import (
     EegPoseModelConfig,
     EegPoseVAE,
+    OnlineEegCalibrator,
     ReadinessMetrics,
+    build_profile_model,
     build_context_windows,
     format_training_report,
+    install_profile_model,
     load_model,
+    profile_start_checkpoint,
+    reset_band_adapter_identity,
     score_readiness,
     set_trainable_scope,
     should_commit_profile_update,
@@ -24,10 +30,14 @@ from eeg_encoding import (
     transformed_eeg_feature_count,
     trusted_calibration_mask,
 )
+from eeg_encoding.model import save_model
+from eeg_encoding.personalization import load_profile_session
 from pose_encoding import PoseLatentFrame, PoseLatentStream
 from streaming.eeg import EegPacket, SignalStreamer
+from streaming.pose import PoseLandmark, PoseResult
 from streaming import (
     CalibrationOverlayState,
+    CalibrationDisplayStatus,
     RegionScores,
     PoseLatentBuffer,
     dummy_positions_for_block,
@@ -383,6 +393,36 @@ def test_daily_recalibration_freezes_first_encoder_layer() -> None:
     assert "encoder.2.weight" in trainable
 
 
+def test_adapter_ablation_scopes_only_unfreeze_requested_layers() -> None:
+    config = EegPoseModelConfig(
+        n_channels=2,
+        n_samples=200,
+        eeg_feature_count=201,
+        pose_latent_dim=3,
+        context_packet_count=2,
+        hidden_dim=16,
+        model_latent_dim=5,
+        wavelet_band_lengths=(13, 13, 25, 50, 100),
+    )
+    model = EegPoseVAE(config)
+
+    set_trainable_scope(model, "adapter_only")
+    trainable = trainable_parameter_names(model)
+
+    assert trainable == ("band_adapter.scale", "band_adapter.bias")
+
+    set_trainable_scope(model, "adapter_head")
+    trainable = trainable_parameter_names(model)
+
+    assert "band_adapter.scale" in trainable
+    assert "band_adapter.bias" in trainable
+    assert "pose_head.weight" in trainable
+    assert "pose_head.bias" in trainable
+    assert "latent_mean.weight" not in trainable
+    assert "latent_log_variance.weight" not in trainable
+    assert "encoder.0.weight" not in trainable
+
+
 def test_session_update_does_not_mutate_base_model() -> None:
     config = EegPoseModelConfig(
         n_channels=2,
@@ -415,6 +455,326 @@ def test_session_update_does_not_mutate_base_model() -> None:
 
     for name, value in base_model.state_dict().items():
         torch.testing.assert_close(value, base_state[name])
+
+
+class DummyPoseDecoder(torch.nn.Module):
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        output = torch.zeros(
+            latents.shape[0],
+            48,
+            dtype=latents.dtype,
+            device=latents.device,
+        )
+        output[:, : latents.shape[1]] = latents
+        output[:, 24 : 24 + latents.shape[1]] = latents
+        return output
+
+
+def make_online_model() -> EegPoseVAE:
+    return EegPoseVAE(
+        EegPoseModelConfig(
+            n_channels=2,
+            n_samples=200,
+            eeg_feature_count=201,
+            pose_latent_dim=3,
+            context_packet_count=2,
+            hidden_dim=16,
+            model_latent_dim=5,
+            wavelet_band_lengths=(13, 13, 25, 50, 100),
+            standardize_pose_latents=False,
+        )
+    )
+
+
+def make_online_frame(index: int, *, trusted: bool = True) -> PairedTrainingFrame:
+    rng = np.random.default_rng(index)
+    return PairedTrainingFrame(
+        packet_id=index,
+        eeg=rng.normal(size=(2, 200)).astype(np.float32),
+        target_time_s=float(index),
+        pose_latent=np.asarray([0.2, -0.1, 0.3], dtype=np.float32),
+        pose_confidence=0.9 if trusted else 0.1,
+        pose_reconstruction_error=0.02,
+        interpolation_confidence=0.9,
+    )
+
+
+def test_online_calibrator_rejects_untrusted_frames() -> None:
+    calibrator = OnlineEegCalibrator(
+        make_online_model(),
+        DummyPoseDecoder(),
+        min_batch_size=2,
+        update_every=2,
+        steps_per_update=1,
+    )
+
+    accepted = calibrator.observe(make_online_frame(1, trusted=False))
+
+    assert accepted is False
+    assert calibrator.trusted_sample_count == 0
+    assert calibrator.skipped_samples == 1
+
+
+def test_online_calibrator_updates_after_trusted_batch() -> None:
+    model = make_online_model()
+    before = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+    calibrator = OnlineEegCalibrator(
+        model,
+        DummyPoseDecoder(),
+        min_batch_size=2,
+        update_every=2,
+        steps_per_update=1,
+        batch_size=2,
+    )
+
+    calibrator.observe(make_online_frame(1))
+    calibrator.observe(make_online_frame(2))
+    status = calibrator.status()
+
+    assert status.trusted_samples == 2
+    assert status.update_count == 1
+    assert status.latest_loss is not None
+    assert any(
+        not torch.allclose(value, before[name])
+        for name, value in model.state_dict().items()
+        if name in before
+    )
+
+
+def test_online_calibrator_saves_session_artifacts() -> None:
+    session_dir = output_path("online_calibration_session")
+    calibrator = OnlineEegCalibrator(
+        make_online_model(),
+        DummyPoseDecoder(),
+        min_batch_size=2,
+        update_every=2,
+        steps_per_update=1,
+        batch_size=2,
+    )
+    calibrator.observe(make_online_frame(1))
+    calibrator.observe(make_online_frame(2))
+
+    calibrator.save(session_dir)
+
+    assert (session_dir / "session_model.pt").exists()
+    assert (session_dir / "trusted_calibration_samples.npz").exists()
+    assert (session_dir / "online_status.json").exists()
+
+
+def test_profile_start_uses_fallback_until_profile_exists() -> None:
+    profiles_root = output_path("profile_start_root")
+    fallback = output_path("fallback_model.pt")
+
+    start = profile_start_checkpoint(
+        "profile_user",
+        fallback,
+        profiles_root=profiles_root,
+    )
+
+    assert start == fallback
+
+
+def test_install_profile_model_sets_primary_profile_model() -> None:
+    profiles_root = output_path("install_profile_root")
+    source = output_path("install_source_model.pt")
+    save_model(source, make_online_model())
+
+    profile_model = install_profile_model(
+        "profile_user",
+        source,
+        profiles_root=profiles_root,
+        update_kind="test_install",
+    )
+
+    assert profile_model.exists()
+    assert profile_start_checkpoint(
+        "profile_user",
+        source,
+        profiles_root=profiles_root,
+    ) == profile_model
+
+
+def make_profile_build_dataset(path: Path, seed: int, *, n_samples: int = 10) -> None:
+    rng = np.random.default_rng(seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        packet_id=np.arange(n_samples, dtype=np.int64),
+        eeg=rng.normal(size=(n_samples, 2, 200)).astype(np.float32),
+        target_time_s=np.arange(n_samples, dtype=np.float64),
+        pose_latent=rng.normal(size=(n_samples, 3)).astype(np.float32),
+        pose_confidence=np.full(n_samples, 0.95, dtype=np.float32),
+        interpolation_confidence=np.full(n_samples, 0.9, dtype=np.float32),
+        pose_reconstruction_error=np.full(n_samples, 0.04, dtype=np.float32),
+    )
+
+
+def test_reset_band_adapter_identity_restores_profile_save_state() -> None:
+    model = make_online_model()
+    with torch.no_grad():
+        model.band_adapter.scale.fill_(1.5)
+        model.band_adapter.bias.fill_(0.25)
+
+    reset_band_adapter_identity(model)
+
+    torch.testing.assert_close(model.band_adapter.scale, torch.ones_like(model.band_adapter.scale))
+    torch.testing.assert_close(model.band_adapter.bias, torch.zeros_like(model.band_adapter.bias))
+
+
+def unique_output_path(name: str) -> Path:
+    return output_path(f"{name}_{uuid.uuid4().hex}")
+
+
+def test_profile_build_creates_primary_profile_from_paired_data() -> None:
+    root = unique_output_path("profile_build")
+    profiles_root = root / "profiles"
+    data_path = root / "session_01.npz"
+    base_path = root / "base.pt"
+    make_profile_build_dataset(data_path, 31)
+    train_model(
+        data_path,
+        base_path,
+        epochs=1,
+        batch_size=4,
+        hidden_dim=16,
+        model_latent_dim=5,
+        pose_checkpoint=None,
+    )
+
+    report = build_profile_model(
+        user_id="profile_user",
+        new_session_data=data_path,
+        base_checkpoint=base_path,
+        profiles_root=profiles_root,
+        epochs=1,
+        inner_epochs=1,
+        query_epochs=1,
+        batch_size=4,
+        pose_checkpoint=None,
+    )
+
+    profile_model = profiles_root / "profile_user" / "profile_model.pt"
+    history_dir = Path(report.history_dir)
+    assert report.committed is True
+    assert profile_model.exists()
+    assert (history_dir / "proposed_profile_model.pt").exists()
+    assert (history_dir / "profile_build_report.json").exists()
+    assert (history_dir / "profile_build_summary.csv").exists()
+    session_dirs = [
+        path
+        for path in (profiles_root / "profile_user" / "profile_history").iterdir()
+        if (path / "paired_profile_session.npz").exists()
+    ]
+    assert len(session_dirs) == 1
+    assert (session_dirs[0] / "paired_profile_session.npz").exists()
+    model = load_model(profile_model).model
+    torch.testing.assert_close(model.band_adapter.scale, torch.ones_like(model.band_adapter.scale))
+    torch.testing.assert_close(model.band_adapter.bias, torch.zeros_like(model.band_adapter.bias))
+
+
+def test_second_profile_build_uses_existing_profile_and_session_history() -> None:
+    root = unique_output_path("profile_build_existing")
+    profiles_root = root / "profiles"
+    first_data = root / "session_01.npz"
+    second_data = root / "session_02.npz"
+    base_path = root / "base.pt"
+    make_profile_build_dataset(first_data, 41)
+    make_profile_build_dataset(second_data, 42)
+    train_model(
+        first_data,
+        base_path,
+        epochs=1,
+        batch_size=4,
+        hidden_dim=16,
+        model_latent_dim=5,
+        pose_checkpoint=None,
+    )
+    first = build_profile_model(
+        user_id="profile_user",
+        new_session_data=first_data,
+        base_checkpoint=base_path,
+        profiles_root=profiles_root,
+        epochs=1,
+        inner_epochs=1,
+        query_epochs=1,
+        batch_size=4,
+        pose_checkpoint=None,
+    )
+
+    second = build_profile_model(
+        user_id="profile_user",
+        new_session_data=second_data,
+        base_checkpoint=base_path,
+        profiles_root=profiles_root,
+        epochs=1,
+        inner_epochs=1,
+        query_epochs=1,
+        batch_size=4,
+        pose_checkpoint=None,
+    )
+
+    assert second.start_checkpoint == str(profiles_root / "profile_user" / "profile_model.pt")
+    assert second.session_count == 2
+    assert Path(first.history_dir) != Path(second.history_dir)
+
+
+def test_profile_session_uses_file_level_query_split() -> None:
+    root = unique_output_path("profile_file_split")
+    first = root / "source_00.npz"
+    second = root / "source_01.npz"
+    make_profile_build_dataset(first, 51, n_samples=6)
+    make_profile_build_dataset(second, 52, n_samples=4)
+
+    session = load_profile_session([first, second], query_fraction=0.5)
+
+    np.testing.assert_array_equal(session.support_indices, np.arange(6))
+    np.testing.assert_array_equal(session.query_indices, np.arange(6, 10))
+
+
+def test_profile_build_treats_data_folders_as_distinct_sessions() -> None:
+    root = unique_output_path("profile_build_folder_sessions")
+    profiles_root = root / "profiles"
+    first_dir = root / "session_a"
+    second_dir = root / "session_b"
+    base_path = root / "base.pt"
+    make_profile_build_dataset(first_dir / "run_01.npz", 61)
+    make_profile_build_dataset(first_dir / "run_02.npz", 62)
+    make_profile_build_dataset(second_dir / "run_01.npz", 63)
+    make_profile_build_dataset(second_dir / "run_02.npz", 64)
+    train_model(
+        first_dir / "run_01.npz",
+        base_path,
+        epochs=1,
+        batch_size=4,
+        hidden_dim=16,
+        model_latent_dim=5,
+        pose_checkpoint=None,
+    )
+
+    report = build_profile_model(
+        user_id="profile_user",
+        new_session_data=[first_dir, second_dir],
+        base_checkpoint=base_path,
+        profiles_root=profiles_root,
+        epochs=1,
+        inner_epochs=1,
+        query_epochs=1,
+        batch_size=4,
+        pose_checkpoint=None,
+    )
+
+    assert report.session_count == 2
+    history_dirs = [
+        path
+        for path in (profiles_root / "profile_user" / "profile_history").iterdir()
+        if (path / "paired_profile_session.npz").exists()
+    ]
+    assert len(history_dirs) == 2
+    assert all((path / "source_00.npz").exists() for path in history_dirs)
+    assert all((path / "source_01.npz").exists() for path in history_dirs)
 
 
 def test_fake_daily_recalibration_saves_session_model() -> None:
@@ -466,25 +826,28 @@ def test_fake_daily_recalibration_saves_session_model() -> None:
 
 def test_profile_commit_rejects_regressed_metrics() -> None:
     old_metrics = {
-        "validation_pose_mae": 0.3,
+        "decoded_pose_error": 0.3,
         "stationary_false_positive_score": 0.2,
         "movement_response_score": 0.7,
+        "readiness_score": 0.8,
     }
 
     assert not should_commit_profile_update(
         old_metrics,
         {
-            "validation_pose_mae": 0.35,
+            "decoded_pose_error": 0.35,
             "stationary_false_positive_score": 0.2,
             "movement_response_score": 0.7,
+            "readiness_score": 0.8,
         },
     )
     assert should_commit_profile_update(
         old_metrics,
         {
-            "validation_pose_mae": 0.25,
+            "decoded_pose_error": 0.25,
             "stationary_false_positive_score": 0.15,
             "movement_response_score": 0.75,
+            "readiness_score": 0.85,
         },
     )
 
@@ -590,11 +953,14 @@ def test_positions_from_feature_vector_uses_position_features_only() -> None:
 def test_calibration_overlay_renders_truth_dummy_and_eeg_layers() -> None:
     class FakeCv2:
         LINE_AA = 16
+        FONT_HERSHEY_SIMPLEX = 0
 
         def __init__(self) -> None:
             self.lines = []
             self.circles = []
             self.weights = []
+            self.rectangles = []
+            self.text = []
 
         def line(self, *args, **kwargs) -> None:
             self.lines.append((args, kwargs))
@@ -606,6 +972,12 @@ def test_calibration_overlay_renders_truth_dummy_and_eeg_layers() -> None:
             self.weights.append(alpha)
             dst[:] = overlay
 
+        def rectangle(self, *args, **kwargs) -> None:
+            self.rectangles.append((args, kwargs))
+
+        def putText(self, *args, **kwargs) -> None:
+            self.text.append((args, kwargs))
+
     frame = np.zeros((120, 160, 3), dtype=np.uint8)
     overlay = CalibrationOverlayState()
     truth = np.zeros(48, dtype=np.float32)
@@ -614,6 +986,16 @@ def test_calibration_overlay_renders_truth_dummy_and_eeg_layers() -> None:
     overlay.update_truth(truth)
     overlay.update_eeg(eeg)
     overlay.update_dummy(select_next_movement_block(RegionScores(1, 0, 0, 0, 0, 0)), 0.5)
+    overlay.update_status(
+        CalibrationDisplayStatus(
+            readiness_score=0.75,
+            ready=False,
+            trusted_samples=12,
+            skipped_samples=3,
+            update_count=2,
+            latest_loss=0.4,
+        )
+    )
     cv2 = FakeCv2()
 
     overlay.render(frame, cv2, pose_result=None, mirror_x=False)
@@ -621,6 +1003,105 @@ def test_calibration_overlay_renders_truth_dummy_and_eeg_layers() -> None:
     assert cv2.lines
     assert cv2.circles
     assert cv2.weights
+    assert cv2.rectangles
+    assert cv2.text
+
+
+def test_calibration_overlay_mirrors_skeleton_geometry() -> None:
+    class FakeCv2:
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.lines = []
+
+        def line(self, *args, **kwargs) -> None:
+            self.lines.append((args, kwargs))
+
+        def circle(self, *args, **kwargs) -> None:
+            pass
+
+        def addWeighted(self, overlay, alpha, frame, beta, gamma, dst) -> None:
+            dst[:] = overlay
+
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    truth = np.zeros(48, dtype=np.float32)
+    truth[:6] = np.asarray([-1.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    overlay = CalibrationOverlayState()
+    overlay.update_truth(truth)
+    cv2 = FakeCv2()
+
+    overlay.render(frame, cv2, pose_result=None, mirror_x=True)
+
+    assert cv2.lines[0][0][1][0] > cv2.lines[0][0][2][0]
+
+
+def test_calibration_overlay_fits_truth_to_image_space_landmarks() -> None:
+    class FakeCv2:
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.lines = []
+
+        def line(self, *args, **kwargs) -> None:
+            self.lines.append((args, kwargs))
+
+        def circle(self, *args, **kwargs) -> None:
+            pass
+
+        def addWeighted(self, overlay, alpha, frame, beta, gamma, dst) -> None:
+            dst[:] = overlay
+
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    truth_positions = np.asarray(
+        [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [-1.4, 0.0, 0.0],
+            [1.4, 0.0, 0.0],
+            [-1.6, 1.0, 0.0],
+            [1.6, 1.0, 0.0],
+            [-0.8, 1.2, 0.0],
+            [0.8, 1.2, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    expected_points = truth_positions[:, :2] * 30.0 + np.asarray([90.0, 70.0])
+    landmarks = [PoseLandmark(None, None, None, None, None) for _ in range(25)]
+    for point, landmark_index in zip(
+        expected_points,
+        (11, 12, 13, 14, 15, 16, 23, 24),
+    ):
+        landmarks[landmark_index] = PoseLandmark(
+            float(point[0] / 200.0),
+            float(point[1] / 200.0),
+            0.0,
+            1.0,
+            1.0,
+        )
+    result = PoseResult(1, 1.0, 200, 200, landmarks, [], True)
+    feature_vector = np.zeros(48, dtype=np.float32)
+    feature_vector[:24] = truth_positions.reshape(-1)
+    overlay = CalibrationOverlayState()
+    overlay.update_truth(feature_vector)
+    cv2 = FakeCv2()
+
+    overlay.render(frame, cv2, pose_result=result, mirror_x=False)
+
+    assert cv2.lines[0][0][1] == (60, 40)
+    assert cv2.lines[0][0][2] == (120, 40)
+
+
+def test_calibration_eeg_overlay_is_display_smoothed() -> None:
+    overlay = CalibrationOverlayState(eeg_display_smoothing=0.25)
+    first = np.zeros(48, dtype=np.float32)
+    second = np.zeros(48, dtype=np.float32)
+    second[0] = 4.0
+
+    overlay.update_eeg(first)
+    overlay.update_eeg(second)
+
+    assert overlay._eeg_positions is not None
+    assert overlay._eeg_positions[0, 0] == 1.0
 
 
 def test_pose_encoding_exports_public_wrapper() -> None:

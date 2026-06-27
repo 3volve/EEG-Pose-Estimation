@@ -47,6 +47,7 @@ class AsyncPoseEstimator:
         result_queue_size: int = POSE_RESULT_QUEUE_SIZE,
         mirror_frame: bool = False,
         draw_preview: bool = False,
+        draw_builtin_pose_overlay: bool = True,
         preview_renderer: Callable[[Any, ModuleType, PoseResult | None, bool], None] | None = None,
     ) -> None:
         if target_fps <= 0:
@@ -59,6 +60,7 @@ class AsyncPoseEstimator:
         self.target_fps = target_fps
         self.mirror_frame = mirror_frame
         self.draw_preview = draw_preview
+        self.draw_builtin_pose_overlay = draw_builtin_pose_overlay
         self.preview_renderer = preview_renderer
 
         self._results: Queue[PoseResult] = Queue(maxsize=result_queue_size)
@@ -239,17 +241,14 @@ class AsyncPoseEstimator:
             self._landmarker.detect_async(mp_image, timestamp_ms)
 
             if self.draw_preview:
-                preview_frame = (
-                    self._cv2.flip(frame, 1)
-                    if self.mirror_frame
-                    else frame.copy()
-                )
+                preview_frame = self._preview_frame(frame)
                 result = self.get_latest()
-                self._draw_pose_overlay(
-                    preview_frame,
-                    result,
-                    mirror_x=self.mirror_frame,
-                )
+                if self.draw_builtin_pose_overlay:
+                    self._draw_pose_overlay(
+                        preview_frame,
+                        result,
+                        mirror_x=self.mirror_frame,
+                    )
                 if self.preview_renderer is not None:
                     self.preview_renderer(
                         preview_frame,
@@ -266,6 +265,12 @@ class AsyncPoseEstimator:
                 next_capture_time + frame_period_s,
                 time.monotonic(),
             )
+
+    def _preview_frame(self, frame: Any) -> Any:
+        assert self._cv2 is not None
+        if self.mirror_frame:
+            return self._cv2.flip(frame, 1)
+        return frame.copy()
 
     def _draw_pose_overlay(
         self,

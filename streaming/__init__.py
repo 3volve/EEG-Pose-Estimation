@@ -1,6 +1,7 @@
 from .collection import collect_paired_frames, collect_and_save_paired_frames, pair_packet
 from .calibration import (
     CalibrationMovementBlock,
+    CalibrationDisplayStatus,
     CalibrationOverlayState,
     DEFAULT_CALIBRATION_BLOCKS,
     RegionScores,
@@ -16,6 +17,7 @@ from .records import PairedTrainingFrame
 
 __all__ = [
     "CalibrationMovementBlock",
+    "CalibrationDisplayStatus",
     "CalibrationOverlayState",
     "DEFAULT_CALIBRATION_BLOCKS",
     "InterpolatedPoseLatent",
