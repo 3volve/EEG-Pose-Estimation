@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 import time
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 import eeg_encoding
+import numpy as np
 import torch
 from config import (
     ROOT_DIR,
-    BASE_OUTPUT_DIR,
     COLLECT_DURATION_S,
     DEFAULT_DEVICE,
     EEG_CONTEXT_PACKET_COUNT,
@@ -59,8 +61,12 @@ from streaming import (
     CalibrationDisplayStatus,
     CalibrationOverlayState,
     PoseLatentBuffer,
+    ProfileBlockResult,
     collect_and_save_paired_frames,
+    profile_build_sequence,
     pair_packet,
+    save_paired_frames,
+    validate_profile_block,
 )
 
 
@@ -195,6 +201,7 @@ def parse_args() -> argparse.Namespace:
     profile_build.add_argument("--camera-index", type=int, default=POSE_CAMERA_INDEX)
     profile_build.add_argument("--pose-fps", type=float, default=POSE_TARGET_FPS)
     profile_build.add_argument("--duration", type=float, default=EEG_PROFILE_CREATION_DURATION_S)
+    profile_build.add_argument("--posture", choices=["standing", "sitting"], default="standing")
     profile_build.add_argument("--max-pose-gap", type=float, default=PAIRING_MAX_POSE_GAP_S)
     profile_build.add_argument("--mirror-preview", dest="mirror_preview", action="store_true")
     profile_build.add_argument("--no-mirror-preview", dest="mirror_preview", action="store_false")
@@ -364,6 +371,10 @@ def profile_build(args: argparse.Namespace) -> None:
         session_data = paths.sessions_root / session_id / "paired_profile_session.npz"
         collect_profile_build_session(args, session_data)
 
+    print(
+        "Data collection is complete; starting profile training and evaluation.",
+        flush=True,
+    )
     report = eeg_encoding.build_profile_model(
         user_id=args.user_id,
         new_session_data=session_data,
@@ -386,13 +397,17 @@ def collect_profile_build_session(
     args: argparse.Namespace,
     out_path: str | Path,
 ) -> None:
+    session_id = Path(out_path).parent.name
     eeg_stream = SignalStreamer()
+    overlay_state = CalibrationOverlayState()
     pose_estimator = AsyncPoseEstimator(
         model_path=args.pose_model,
         camera_index=args.camera_index,
         target_fps=args.pose_fps,
         mirror_frame=args.mirror_preview,
         draw_preview=True,
+        draw_builtin_pose_overlay=False,
+        preview_renderer=overlay_state.render,
     )
     pose_stream = PoseLatentStream.from_checkpoint(
         pose_estimator,
@@ -407,12 +422,19 @@ def collect_profile_build_session(
     try:
         pose_estimator.start()
         eeg_thread.start()
-        frames = collect_and_save_paired_frames(
+        frames, block_results = collect_guided_profile_build_frames(
             eeg_stream,
             pose_stream,
             duration_s=args.duration,
-            out_path=str(out_path),
             max_pose_gap_s=args.max_pose_gap,
+            overlay_state=overlay_state,
+        )
+        save_guided_profile_build_frames(
+            out_path,
+            frames,
+            block_results,
+            session_id=session_id,
+            posture=args.posture,
             metadata={
                 "sample_kind": "profile_build_session",
                 "pose_model": args.pose_model,
@@ -427,7 +449,198 @@ def collect_profile_build_session(
         eeg_stream.stop_streaming()
         pose_estimator.stop()
         eeg_thread.join(timeout=2.0)
-    print(f"Saved {len(frames)} profile paired frames to {Path(out_path)}")
+    accepted_blocks = sum(result.accepted for result in block_results)
+    print(
+        f"Saved {len(frames)} profile paired frames from "
+        f"{accepted_blocks}/{len(block_results)} accepted blocks to {Path(out_path)}"
+    )
+
+
+def collect_guided_profile_build_frames(
+    eeg_stream,
+    pose_stream,
+    *,
+    duration_s: float,
+    max_pose_gap_s: float,
+    overlay_state: CalibrationOverlayState,
+) -> tuple[list, list[ProfileBlockResult]]:
+    pose_buffer = PoseLatentBuffer(max_gap_s=max_pose_gap_s)
+    sequence = profile_build_sequence()
+    block_states = [
+        {
+            "block": block,
+            "repeat_index": _repeat_index(sequence, index),
+            "start_time_s": 0.0,
+            "end_time_s": 0.0,
+            "frames": [],
+            "feature_vectors": [],
+            "pose_confidences": [],
+            "last_pose_timestamp_ms": None,
+        }
+        for index, block in enumerate(sequence)
+    ]
+    pending_packets = []
+    collection_started_at = time.monotonic()
+    collection_deadline = (
+        collection_started_at + duration_s
+        if duration_s > 0
+        else float("inf")
+    )
+    block_index = 0
+    block_started_at = collection_started_at
+    block_states[0]["start_time_s"] = block_started_at
+
+    while block_index < len(sequence) and time.monotonic() < collection_deadline:
+        now = time.monotonic()
+        block = sequence[block_index]
+        if now - block_started_at >= block.duration_s:
+            block_states[block_index]["end_time_s"] = now
+            block_index += 1
+            if block_index >= len(sequence):
+                break
+            block_started_at = now
+            block_states[block_index]["start_time_s"] = now
+            block = sequence[block_index]
+
+        overlay_state.update_dummy(block, now - block_started_at)
+        pose_frame = pose_stream.get_latest()
+        pose_buffer.add(pose_frame)
+        if pose_frame is not None and pose_frame.pose_detected:
+            overlay_state.update_truth(pose_frame.feature_vector)
+            state = block_states[block_index]
+            if state["last_pose_timestamp_ms"] != pose_frame.timestamp_ms:
+                state["feature_vectors"].append(pose_frame.feature_vector.copy())
+                state["pose_confidences"].append(float(pose_frame.confidence))
+                state["last_pose_timestamp_ms"] = pose_frame.timestamp_ms
+
+        while True:
+            packet = eeg_stream.pop_packet()
+            if packet is None:
+                break
+            pending_packets.append((packet, block_index))
+
+        pending_packets = _pair_pending_profile_packets(
+            pending_packets,
+            pose_buffer,
+            block_states,
+        )
+        time.sleep(PAIRING_POLL_DELAY_S)
+
+    finished_at = time.monotonic()
+    for index, state in enumerate(block_states):
+        if state["start_time_s"] == 0.0:
+            state["start_time_s"] = finished_at
+        if state["end_time_s"] == 0.0:
+            state["end_time_s"] = finished_at
+
+    drain_deadline = time.monotonic() + max_pose_gap_s
+    while pending_packets and time.monotonic() < drain_deadline:
+        pose_buffer.add(pose_stream.get_latest())
+        pending_packets = _pair_pending_profile_packets(
+            pending_packets,
+            pose_buffer,
+            block_states,
+        )
+        time.sleep(PAIRING_POLL_DELAY_S)
+
+    block_results = [
+        validate_profile_block(
+            block_id=index,
+            block=state["block"],
+            repeat_index=state["repeat_index"],
+            start_time_s=state["start_time_s"],
+            end_time_s=state["end_time_s"],
+            feature_vectors=state["feature_vectors"],
+            pose_confidences=state["pose_confidences"],
+            paired_sample_count=len(state["frames"]),
+        )
+        for index, state in enumerate(block_states)
+        if state["start_time_s"] < finished_at
+    ]
+    accepted_block_ids = {result.block_id for result in block_results if result.accepted}
+    accepted_frames = []
+    for index, state in enumerate(block_states):
+        if index in accepted_block_ids:
+            accepted_frames.extend(state["frames"])
+    return accepted_frames, block_results
+
+
+def _pair_pending_profile_packets(
+    pending_packets,
+    pose_buffer: PoseLatentBuffer,
+    block_states,
+):
+    still_pending = []
+    latest_pose_time_s = pose_buffer.latest_time_s
+    for packet, block_index in pending_packets:
+        paired = pair_packet(packet, pose_buffer)
+        if paired is not None:
+            block_states[block_index]["frames"].append(paired)
+        elif latest_pose_time_s is None or latest_pose_time_s <= packet.end_time_s:
+            still_pending.append((packet, block_index))
+    return still_pending
+
+
+def _repeat_index(sequence, index: int) -> int:
+    return sum(
+        1
+        for earlier in sequence[:index]
+        if earlier.name == sequence[index].name
+    )
+
+
+def save_guided_profile_build_frames(
+    out_path: str | Path,
+    frames: list,
+    block_results: list[ProfileBlockResult],
+    *,
+    session_id: str,
+    posture: str,
+    metadata: dict[str, object],
+) -> None:
+    if not frames:
+        raise RuntimeError("No accepted guided profile-build frames were collected.")
+    per_frame_block_ids = []
+    per_frame_block_names = []
+    per_frame_repeat_indices = []
+    per_frame_accepted = []
+    frame_index = 0
+    block_result_by_id = {result.block_id: result for result in block_results}
+    for result in block_results:
+        if not result.accepted:
+            continue
+        frame_count = result.paired_sample_count
+        per_frame_block_ids.extend([result.block_id] * frame_count)
+        per_frame_block_names.extend([result.movement_name] * frame_count)
+        per_frame_repeat_indices.extend([result.repeat_index] * frame_count)
+        per_frame_accepted.extend([True] * frame_count)
+        frame_index += frame_count
+    assert frame_index == len(frames)
+    save_paired_frames(
+        out_path,
+        frames,
+        metadata={
+            **metadata,
+            "profile_session_id": session_id,
+            "profile_posture": posture,
+            "profile_block_id": np.asarray(per_frame_block_ids, dtype=np.int64),
+            "profile_block_name": np.asarray(per_frame_block_names),
+            "profile_block_repeat_index": np.asarray(per_frame_repeat_indices, dtype=np.int64),
+            "profile_block_accepted": np.asarray(per_frame_accepted, dtype=np.bool_),
+            "profile_block_summary_json": json.dumps(
+                [
+                    {
+                        **asdict(result),
+                        "accepted": bool(result.accepted),
+                    }
+                    for result in block_results
+                ]
+            ),
+            "profile_accepted_block_count": sum(
+                result.accepted for result in block_result_by_id.values()
+            ),
+        },
+    )
 
 
 def predict_live(args: argparse.Namespace) -> None:

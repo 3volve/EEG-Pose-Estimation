@@ -36,6 +36,7 @@ from pose_encoding import PoseLatentFrame, PoseLatentStream
 from streaming.eeg import EegPacket, SignalStreamer
 from streaming.pose import PoseLandmark, PoseResult
 from streaming import (
+    CalibrationMovementBlock,
     CalibrationOverlayState,
     CalibrationDisplayStatus,
     RegionScores,
@@ -48,6 +49,7 @@ from streaming import (
     region_scores,
     save_paired_frames,
     select_next_movement_block,
+    validate_profile_block,
 )
 from streaming.records import PairedTrainingFrame
 
@@ -734,6 +736,75 @@ def test_profile_session_uses_file_level_query_split() -> None:
     np.testing.assert_array_equal(session.query_indices, np.arange(6, 10))
 
 
+def test_profile_session_uses_block_level_query_split_when_available() -> None:
+    root = unique_output_path("profile_block_split")
+    path = root / "guided_session.npz"
+    make_profile_build_dataset(path, 53, n_samples=9)
+    with np.load(path) as archive:
+        arrays = {key: archive[key] for key in archive.files}
+    arrays.update(
+        {
+            "profile_posture": np.asarray("standing"),
+            "profile_block_id": np.asarray([0, 0, 1, 1, 2, 2, 3, 3, 3], dtype=np.int64),
+            "profile_block_name": np.asarray(
+                [
+                    "neutral_rest",
+                    "neutral_rest",
+                    "left_arm_raise",
+                    "left_arm_raise",
+                    "right_arm_raise",
+                    "right_arm_raise",
+                    "torso_shift",
+                    "torso_shift",
+                    "torso_shift",
+                ]
+            ),
+            "profile_block_repeat_index": np.asarray([0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            "profile_block_accepted": np.ones(9, dtype=np.bool_),
+            "profile_block_summary_json": np.asarray(
+                '[{"movement_name":"neutral_rest","accepted":true},'
+                '{"movement_name":"left_arm_raise","accepted":true},'
+                '{"movement_name":"right_arm_raise","accepted":true},'
+                '{"movement_name":"torso_shift","accepted":true}]'
+            ),
+        }
+    )
+    np.savez_compressed(path, **arrays)
+
+    session = load_profile_session(path, query_fraction=0.25)
+
+    np.testing.assert_array_equal(session.support_indices, np.arange(6))
+    np.testing.assert_array_equal(session.query_indices, np.arange(6, 9))
+    assert session.posture == "standing"
+    assert session.block_summary
+
+
+def test_profile_session_excludes_rejected_block_samples() -> None:
+    root = unique_output_path("profile_rejected_blocks")
+    path = root / "guided_session.npz"
+    make_profile_build_dataset(path, 54, n_samples=6)
+    with np.load(path) as archive:
+        arrays = {key: archive[key] for key in archive.files}
+    arrays.update(
+        {
+            "profile_block_id": np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int64),
+            "profile_block_accepted": np.asarray([True, True, False, False, True, True]),
+            "profile_block_summary_json": np.asarray(
+                '[{"movement_name":"neutral_rest","accepted":true},'
+                '{"movement_name":"left_arm_raise","accepted":false,'
+                '"reject_reason":"insufficient_target_motion"},'
+                '{"movement_name":"right_arm_raise","accepted":true}]'
+            ),
+        }
+    )
+    np.savez_compressed(path, **arrays)
+
+    session = load_profile_session(path, query_fraction=0.5)
+
+    assert len(session.eeg) == 4
+    np.testing.assert_array_equal(session.block_ids, np.asarray([0, 0, 2, 2]))
+
+
 def test_profile_build_treats_data_folders_as_distinct_sessions() -> None:
     root = unique_output_path("profile_build_folder_sessions")
     profiles_root = root / "profiles"
@@ -939,6 +1010,137 @@ def test_dummy_calibration_motion_changes_target_pose() -> None:
     mid = dummy_positions_for_block("left_arm_raise", elapsed_s=2.0, duration_s=4.0)
 
     assert mid[4, 1] < start[4, 1]
+
+
+def feature_vectors_for_block(name: str, *, duration_s: float = 8.0, samples: int = 12) -> list[np.ndarray]:
+    vectors = []
+    for elapsed_s in np.linspace(0.0, duration_s, samples):
+        vector = np.zeros(48, dtype=np.float32)
+        vector[:24] = dummy_positions_for_block(
+            name,
+            elapsed_s=float(elapsed_s),
+            duration_s=duration_s,
+        ).reshape(-1)
+        vectors.append(vector)
+    return vectors
+
+
+def test_profile_block_validator_accepts_imperfect_followed_movement() -> None:
+    vectors = feature_vectors_for_block("left_arm_raise")
+    for vector in vectors:
+        vector[:24] += 0.04
+
+    result = validate_profile_block(
+        block_id=1,
+        block=CalibrationMovementBlock("left_arm_raise", "left_arm", 8.0),
+        repeat_index=0,
+        start_time_s=10.0,
+        end_time_s=18.0,
+        feature_vectors=vectors,
+        pose_confidences=[0.85] * len(vectors),
+        paired_sample_count=20,
+    )
+
+    assert result.accepted is True
+    assert result.reject_reason == ""
+
+
+def test_profile_block_validator_rejects_low_pose_quality() -> None:
+    vectors = feature_vectors_for_block("right_arm_raise")
+
+    result = validate_profile_block(
+        block_id=2,
+        block=CalibrationMovementBlock("right_arm_raise", "right_arm", 8.0),
+        repeat_index=0,
+        start_time_s=10.0,
+        end_time_s=18.0,
+        feature_vectors=vectors,
+        pose_confidences=[0.2] * len(vectors),
+        paired_sample_count=20,
+    )
+
+    assert result.accepted is False
+    assert result.reject_reason == "low_pose_quality"
+
+
+def test_profile_block_validator_rejects_impossible_jumps() -> None:
+    vectors = feature_vectors_for_block("left_arm_raise")
+    vectors[5] = vectors[5].copy()
+    vectors[5][0] += 4.0
+
+    result = validate_profile_block(
+        block_id=3,
+        block=CalibrationMovementBlock("left_arm_raise", "left_arm", 8.0),
+        repeat_index=0,
+        start_time_s=10.0,
+        end_time_s=18.0,
+        feature_vectors=vectors,
+        pose_confidences=[0.85] * len(vectors),
+        paired_sample_count=20,
+    )
+
+    assert result.accepted is False
+    assert result.reject_reason == "impossible_pose_jumps"
+
+
+def test_profile_block_validator_rejects_inactive_movement_block() -> None:
+    neutral = np.zeros(48, dtype=np.float32)
+    neutral[:24] = dummy_positions_for_block(
+        "neutral_rest",
+        elapsed_s=0.0,
+        duration_s=8.0,
+    ).reshape(-1)
+    vectors = [neutral.copy() for _ in range(12)]
+
+    result = validate_profile_block(
+        block_id=4,
+        block=CalibrationMovementBlock("left_forward_reach", "left_arm", 8.0),
+        repeat_index=0,
+        start_time_s=10.0,
+        end_time_s=18.0,
+        feature_vectors=vectors,
+        pose_confidences=[0.85] * len(vectors),
+        paired_sample_count=20,
+    )
+
+    assert result.accepted is False
+    assert result.reject_reason == "insufficient_target_motion"
+
+
+def test_profile_block_validator_rejects_overactive_rest_block() -> None:
+    vectors = feature_vectors_for_block("torso_shift")
+
+    result = validate_profile_block(
+        block_id=5,
+        block=CalibrationMovementBlock("neutral_rest", "rest", 8.0, rest=True),
+        repeat_index=0,
+        start_time_s=10.0,
+        end_time_s=18.0,
+        feature_vectors=vectors,
+        pose_confidences=[0.85] * len(vectors),
+        paired_sample_count=20,
+    )
+
+    assert result.accepted is False
+    assert result.reject_reason == "rest_too_active"
+
+
+def test_profile_block_validator_rejects_wrong_motion_pattern() -> None:
+    vectors = feature_vectors_for_block("torso_shift")
+
+    result = validate_profile_block(
+        block_id=6,
+        block=CalibrationMovementBlock("left_arm_raise", "left_arm", 8.0),
+        repeat_index=0,
+        start_time_s=10.0,
+        end_time_s=18.0,
+        feature_vectors=vectors,
+        pose_confidences=[0.85] * len(vectors),
+        paired_sample_count=20,
+    )
+
+    assert result.accepted is False
+    assert result.reject_reason in {"insufficient_target_motion", "wrong_motion_pattern"}
 
 
 def test_positions_from_feature_vector_uses_position_features_only() -> None:

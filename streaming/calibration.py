@@ -50,6 +50,26 @@ class CalibrationMovementBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileBlockResult:
+    block_id: int
+    movement_name: str
+    repeat_index: int
+    start_time_s: float
+    end_time_s: float
+    accepted: bool
+    acceptance_score: float
+    reject_reason: str
+    paired_sample_count: int
+    pose_sample_count: int
+    mean_pose_confidence: float
+    target_motion: float
+    rest_motion: float
+    direction_score: float
+    jump_score: float
+    guide_distance: float
+
+
+@dataclass(frozen=True, slots=True)
 class RegionScores:
     left_arm: float
     right_arm: float
@@ -77,6 +97,22 @@ DEFAULT_CALIBRATION_BLOCKS: tuple[CalibrationMovementBlock, ...] = (
     CalibrationMovementBlock("wrist_forearm", "arms", 6.0),
     CalibrationMovementBlock("torso_shift", "shoulders_core", 6.0),
     CalibrationMovementBlock("hip_shift", "hips", 6.0),
+)
+
+PROFILE_BUILD_REPEATS: int = 3
+PROFILE_BUILD_REST_DURATION_S: float = 4.0
+PROFILE_BUILD_BLOCKS: tuple[CalibrationMovementBlock, ...] = (
+    CalibrationMovementBlock("neutral_rest", "rest", 20.0, rest=True),
+    CalibrationMovementBlock("left_arm_raise", "left_arm", 8.0),
+    CalibrationMovementBlock("right_arm_raise", "right_arm", 8.0),
+    CalibrationMovementBlock("left_elbow_bend", "left_arm", 8.0),
+    CalibrationMovementBlock("right_elbow_bend", "right_arm", 8.0),
+    CalibrationMovementBlock("left_forward_reach", "left_arm", 8.0),
+    CalibrationMovementBlock("right_forward_reach", "right_arm", 8.0),
+    CalibrationMovementBlock("both_arms_raise", "arms", 8.0),
+    CalibrationMovementBlock("arms_open_close", "arms", 8.0),
+    CalibrationMovementBlock("torso_shift", "shoulders_core", 8.0),
+    CalibrationMovementBlock("hip_shift", "hips", 8.0),
 )
 
 
@@ -116,6 +152,29 @@ def dummy_positions_for_block(
     elif block_name == "right_arm_raise":
         positions[3] += np.asarray([0.12, -0.75 * phase, 0.0], dtype=np.float32)
         positions[5] += np.asarray([0.06, -1.35 * phase, 0.0], dtype=np.float32)
+    elif block_name == "left_elbow_bend":
+        bend = np.sin(2.0 * np.pi * _cycle(elapsed_s, duration_s))
+        positions[4] += np.asarray([0.32 * bend, -0.35 * abs(bend), 0.0], dtype=np.float32)
+    elif block_name == "right_elbow_bend":
+        bend = np.sin(2.0 * np.pi * _cycle(elapsed_s, duration_s))
+        positions[5] += np.asarray([-0.32 * bend, -0.35 * abs(bend), 0.0], dtype=np.float32)
+    elif block_name == "left_forward_reach":
+        reach = _smooth_phase(elapsed_s, duration_s)
+        positions[2] += np.asarray([-0.05, -0.15 * reach, -0.2 * reach], dtype=np.float32)
+        positions[4] += np.asarray([-0.08, -0.35 * reach, -0.75 * reach], dtype=np.float32)
+    elif block_name == "right_forward_reach":
+        reach = _smooth_phase(elapsed_s, duration_s)
+        positions[3] += np.asarray([0.05, -0.15 * reach, -0.2 * reach], dtype=np.float32)
+        positions[5] += np.asarray([0.08, -0.35 * reach, -0.75 * reach], dtype=np.float32)
+    elif block_name == "both_arms_raise":
+        positions[2] += np.asarray([-0.12, -0.75 * phase, 0.0], dtype=np.float32)
+        positions[4] += np.asarray([-0.06, -1.35 * phase, 0.0], dtype=np.float32)
+        positions[3] += np.asarray([0.12, -0.75 * phase, 0.0], dtype=np.float32)
+        positions[5] += np.asarray([0.06, -1.35 * phase, 0.0], dtype=np.float32)
+    elif block_name == "arms_open_close":
+        open_amount = 0.45 * np.sin(2.0 * np.pi * _cycle(elapsed_s, duration_s))
+        positions[[2, 4], 0] -= open_amount
+        positions[[3, 5], 0] += open_amount
     elif block_name == "elbow_bends":
         bend = np.sin(2.0 * np.pi * _cycle(elapsed_s, duration_s))
         positions[4] += np.asarray([0.25 * bend, -0.35 * abs(bend), 0.0], dtype=np.float32)
@@ -133,6 +192,243 @@ def dummy_positions_for_block(
         positions[[0, 1], 0] -= 0.15 * shift
 
     return positions
+
+
+def profile_build_sequence(
+    *,
+    repeats: int = PROFILE_BUILD_REPEATS,
+) -> tuple[CalibrationMovementBlock, ...]:
+    sequence: list[CalibrationMovementBlock] = [PROFILE_BUILD_BLOCKS[0]]
+    rest = CalibrationMovementBlock(
+        "rest_between_blocks",
+        "rest",
+        PROFILE_BUILD_REST_DURATION_S,
+        rest=True,
+    )
+    movements = [block for block in PROFILE_BUILD_BLOCKS if not block.rest]
+    for repeat_index in range(repeats):
+        for block in movements:
+            sequence.append(block)
+            if repeat_index != repeats - 1 or block != movements[-1]:
+                sequence.append(rest)
+    return tuple(sequence)
+
+
+def validate_profile_block(
+    *,
+    block_id: int,
+    block: CalibrationMovementBlock,
+    repeat_index: int,
+    start_time_s: float,
+    end_time_s: float,
+    feature_vectors: list[NDArray[np.float32]],
+    pose_confidences: list[float],
+    paired_sample_count: int,
+) -> ProfileBlockResult:
+    if not feature_vectors:
+        return _profile_block_result(
+            block_id,
+            block,
+            repeat_index,
+            start_time_s,
+            end_time_s,
+            accepted=False,
+            score=0.0,
+            reason="low_pose_quality",
+            paired_sample_count=paired_sample_count,
+        )
+
+    positions = np.stack(
+        [positions_from_feature_vector(vector) for vector in feature_vectors],
+        axis=0,
+    )
+    confidence = float(np.mean(pose_confidences)) if pose_confidences else 0.0
+    diffs = np.diff(positions, axis=0)
+    frame_motion = np.linalg.norm(diffs, axis=2) if len(positions) > 1 else np.zeros((0, 8))
+    landmark_motion = np.linalg.norm(np.ptp(positions, axis=0), axis=1)
+    target_indices = _target_landmarks_for_block(block)
+    other_indices = tuple(index for index in range(8) if index not in target_indices)
+    target_motion = float(np.mean(landmark_motion[list(target_indices)]))
+    other_motion = float(np.mean(landmark_motion[list(other_indices)])) if other_indices else 0.0
+    rest_motion = float(np.mean(landmark_motion))
+    jump_score = _impossible_jump_score(frame_motion)
+    direction_score = _direction_agreement(block.name, positions)
+    guide_distance = _guide_distance(block.name, positions, start_time_s, end_time_s)
+
+    if confidence < 0.45 or len(positions) < 3:
+        accepted = False
+        reason = "low_pose_quality"
+    elif jump_score > 1.0:
+        accepted = False
+        reason = "impossible_pose_jumps"
+    elif block.rest and rest_motion > 0.2:
+        accepted = False
+        reason = "rest_too_active"
+    elif not block.rest and target_motion < 0.12:
+        accepted = False
+        reason = "insufficient_target_motion"
+    elif not block.rest and target_motion < other_motion * 0.65:
+        accepted = False
+        reason = "insufficient_target_motion"
+    elif not block.rest and direction_score < 0.15:
+        accepted = False
+        reason = "wrong_motion_pattern"
+    else:
+        accepted = True
+        reason = ""
+
+    pose_score = np.clip((confidence - 0.45) / 0.45, 0.0, 1.0)
+    jump_component = np.clip(1.0 - jump_score, 0.0, 1.0)
+    if block.rest:
+        motion_component = np.clip(1.0 - rest_motion / 0.2, 0.0, 1.0)
+        direction_component = 1.0
+    else:
+        motion_component = np.clip(target_motion / 0.45, 0.0, 1.0)
+        direction_component = np.clip(direction_score, 0.0, 1.0)
+    guide_component = np.clip(1.0 - guide_distance / 2.0, 0.0, 1.0)
+    score = float(
+        0.3 * pose_score
+        + 0.3 * jump_component
+        + 0.25 * motion_component
+        + 0.12 * direction_component
+        + 0.03 * guide_component
+    )
+    if not accepted:
+        score = min(score, 0.49)
+
+    return ProfileBlockResult(
+        block_id=block_id,
+        movement_name=block.name,
+        repeat_index=repeat_index,
+        start_time_s=float(start_time_s),
+        end_time_s=float(end_time_s),
+        accepted=accepted,
+        acceptance_score=score,
+        reject_reason=reason,
+        paired_sample_count=paired_sample_count,
+        pose_sample_count=len(feature_vectors),
+        mean_pose_confidence=confidence,
+        target_motion=target_motion,
+        rest_motion=rest_motion,
+        direction_score=direction_score,
+        jump_score=jump_score,
+        guide_distance=guide_distance,
+    )
+
+
+def _profile_block_result(
+    block_id: int,
+    block: CalibrationMovementBlock,
+    repeat_index: int,
+    start_time_s: float,
+    end_time_s: float,
+    *,
+    accepted: bool,
+    score: float,
+    reason: str,
+    paired_sample_count: int,
+) -> ProfileBlockResult:
+    return ProfileBlockResult(
+        block_id=block_id,
+        movement_name=block.name,
+        repeat_index=repeat_index,
+        start_time_s=float(start_time_s),
+        end_time_s=float(end_time_s),
+        accepted=accepted,
+        acceptance_score=score,
+        reject_reason=reason,
+        paired_sample_count=paired_sample_count,
+        pose_sample_count=0,
+        mean_pose_confidence=0.0,
+        target_motion=0.0,
+        rest_motion=0.0,
+        direction_score=0.0,
+        jump_score=0.0,
+        guide_distance=float("inf"),
+    )
+
+
+def _target_landmarks_for_block(block: CalibrationMovementBlock) -> tuple[int, ...]:
+    if block.name.startswith("left_"):
+        return REGION_LANDMARKS["left_arm"]
+    if block.name.startswith("right_"):
+        return REGION_LANDMARKS["right_arm"]
+    if block.name in ("both_arms_raise", "arms_open_close", "elbow_bends", "wrist_forearm"):
+        return REGION_LANDMARKS["left_arm"] + REGION_LANDMARKS["right_arm"]
+    if block.region in REGION_LANDMARKS:
+        return REGION_LANDMARKS[block.region]
+    return tuple(range(8))
+
+
+def _impossible_jump_score(frame_motion: NDArray[np.float32]) -> float:
+    if len(frame_motion) == 0:
+        return 0.0
+    jump = float(np.percentile(frame_motion, 98))
+    return max(0.0, jump - 0.45) / 0.45
+
+
+def _direction_agreement(block_name: str, positions: NDArray[np.float32]) -> float:
+    if block_name in ("left_arm_raise", "both_arms_raise"):
+        return _upward_range_score(positions, (2, 4))
+    if block_name == "right_arm_raise":
+        return _upward_range_score(positions, (3, 5))
+    if block_name == "left_elbow_bend":
+        return _upward_range_score(positions, (4,))
+    if block_name == "right_elbow_bend":
+        return _upward_range_score(positions, (5,))
+    if block_name == "left_forward_reach":
+        return _range_score(positions, (4,), axis=2) + _upward_range_score(positions, (4,))
+    if block_name == "right_forward_reach":
+        return _range_score(positions, (5,), axis=2) + _upward_range_score(positions, (5,))
+    if block_name == "arms_open_close":
+        left_range = float(np.ptp(positions[:, 4, 0]))
+        right_range = float(np.ptp(positions[:, 5, 0]))
+        return min(left_range + right_range, 1.0)
+    if block_name in ("torso_shift", "hip_shift"):
+        return min(float(np.ptp(positions[:, :, 0].mean(axis=1))), 1.0)
+    if "rest" in block_name:
+        return 1.0
+    return 0.5
+
+
+def _upward_range_score(positions: NDArray[np.float32], indices: tuple[int, ...]) -> float:
+    starts = positions[0, list(indices), 1]
+    highest = np.min(positions[:, list(indices), 1], axis=0)
+    return float(max(0.0, np.mean(starts - highest)))
+
+
+def _range_score(
+    positions: NDArray[np.float32],
+    indices: tuple[int, ...],
+    *,
+    axis: int,
+) -> float:
+    return float(np.mean(np.ptp(positions[:, list(indices), axis], axis=0)))
+
+
+def _guide_distance(
+    block_name: str,
+    positions: NDArray[np.float32],
+    start_time_s: float,
+    end_time_s: float,
+) -> float:
+    if len(positions) == 0:
+        return float("inf")
+    duration = max(end_time_s - start_time_s, 1e-6)
+    guide = np.stack(
+        [
+            dummy_positions_for_block(
+                block_name,
+                elapsed_s=duration * index / max(len(positions) - 1, 1),
+                duration_s=duration,
+            )
+            for index in range(len(positions))
+        ],
+        axis=0,
+    )
+    guide_delta = guide - neutral_dummy_positions()
+    actual_delta = positions - positions[0:1]
+    return float(np.mean(np.linalg.norm(actual_delta - guide_delta, axis=2)))
 
 
 def region_scores(

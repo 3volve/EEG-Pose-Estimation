@@ -105,6 +105,28 @@ class ProfileSession:
     pose_reconstruction_error: np.ndarray
     support_indices: np.ndarray
     query_indices: np.ndarray
+    block_ids: np.ndarray | None = None
+    block_summary: tuple[dict[str, object], ...] = ()
+    posture: str = ""
+
+
+class _ProfileBuildProgress:
+    def __init__(self, total_steps: int) -> None:
+        self.total_steps = total_steps
+        self.completed_steps = 0
+
+    def start(self, description: str) -> None:
+        width = 24
+        filled = round(width * self.completed_steps / self.total_steps)
+        bar = "#" * filled + "-" * (width - filled)
+        print(
+            f"Profile build [{bar}] "
+            f"{self.completed_steps}/{self.total_steps}: {description}",
+            flush=True,
+        )
+
+    def finish_step(self) -> None:
+        self.completed_steps += 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +154,7 @@ class ProfileBuildReport:
     new_metrics: dict[str, float]
     old_session_metrics: tuple[PostAdaptationMetrics, ...] | None
     session_metrics: tuple[PostAdaptationMetrics, ...]
+    session_block_summaries: dict[str, dict[str, object]]
 
 
 def profile_paths(
@@ -384,6 +407,15 @@ def build_profile_model(
         load_profile_session(root, query_fraction=query_fraction)
         for root in session_roots
     ]
+    has_existing_profile = paths.profile_model.exists()
+    progress = _ProfileBuildProgress(
+        total_steps=(
+            (len(sessions) if has_existing_profile else 0)
+            + epochs * len(sessions)
+            + len(sessions)
+            + 1
+        )
+    )
 
     start_checkpoint = profile_start_checkpoint(
         user_id,
@@ -392,7 +424,8 @@ def build_profile_model(
     )
     old_metrics = None
     old_session_metrics = None
-    if paths.profile_model.exists():
+    if has_existing_profile:
+        progress.start("loading the evaluator for the existing profile")
         old_session_metrics = evaluate_profile_post_adaptation(
             paths.profile_model,
             sessions,
@@ -402,9 +435,12 @@ def build_profile_model(
             learning_rate=learning_rate,
             pose_checkpoint=pose_checkpoint,
             device=device,
+            progress=progress,
+            progress_phase="evaluating existing profile",
         )
         old_metrics = summarize_post_adaptation_metrics(old_session_metrics)
 
+    progress.start("loading the starting model and pose decoder")
     proposed_model = _load_raw_model(start_checkpoint, device)
     reset_band_adapter_identity(proposed_model)
     pose_decoder = _load_pose_decoder(
@@ -412,8 +448,12 @@ def build_profile_model(
         pose_latent_dim=sessions[0].pose_latent.shape[1],
         device=device,
     )
-    for _ in range(epochs):
-        for session in sessions:
+    for epoch_index in range(epochs):
+        for session_index, session in enumerate(sessions):
+            progress.start(
+                f"training epoch {epoch_index + 1}/{epochs}, "
+                f"session {session_index + 1}/{len(sessions)} ({session.name})"
+            )
             session_model = copy.deepcopy(proposed_model)
             reset_band_adapter_identity(session_model)
             _train_model_on_session_split(
@@ -440,9 +480,11 @@ def build_profile_model(
             )
             _copy_profile_core_state(session_model, proposed_model)
             reset_band_adapter_identity(proposed_model)
+            progress.finish_step()
 
     proposed_model_path = history_root / "proposed_profile_model.pt"
     reset_band_adapter_identity(proposed_model)
+    progress.start("saving the proposed model and loading its evaluator")
     save_model(proposed_model_path, proposed_model)
     session_metrics = evaluate_profile_post_adaptation(
         proposed_model_path,
@@ -453,8 +495,11 @@ def build_profile_model(
         learning_rate=learning_rate,
         pose_checkpoint=pose_checkpoint,
         device=device,
+        progress=progress,
+        progress_phase="evaluating proposed profile",
     )
     new_metrics = summarize_post_adaptation_metrics(session_metrics)
+    progress.start("comparing metrics, saving the profile, and writing the report")
     committed = should_commit_profile_update(old_metrics, new_metrics)
     if committed:
         shutil.copy2(proposed_model_path, paths.profile_model)
@@ -478,8 +523,14 @@ def build_profile_model(
         new_metrics=new_metrics,
         old_session_metrics=tuple(old_session_metrics) if old_session_metrics else None,
         session_metrics=tuple(session_metrics),
+        session_block_summaries={
+            session.name: _summarize_profile_session_blocks(session)
+            for session in sessions
+        },
     )
     _write_profile_build_report(history_root, report)
+    progress.finish_step()
+    progress.start("complete")
     return report
 
 
@@ -492,10 +543,17 @@ def load_profile_session(
     parts = [_load_profile_arrays(source_path) for source_path in source_paths]
     lengths = [len(part["eeg"]) for part in parts]
     eeg = np.concatenate([part["eeg"] for part in parts], axis=0)
-    support_indices, query_indices = _support_query_indices_for_files(
-        lengths,
-        query_fraction=query_fraction,
-    )
+    block_ids = _merged_block_ids(parts)
+    if block_ids is not None:
+        support_indices, query_indices = _support_query_indices_for_blocks(
+            block_ids,
+            query_fraction=query_fraction,
+        )
+    else:
+        support_indices, query_indices = _support_query_indices_for_files(
+            lengths,
+            query_fraction=query_fraction,
+        )
     return ProfileSession(
         name=name,
         source_paths=tuple(source_paths),
@@ -512,6 +570,13 @@ def load_profile_session(
         ),
         support_indices=support_indices,
         query_indices=query_indices,
+        block_ids=block_ids,
+        block_summary=tuple(
+            summary
+            for part in parts
+            for summary in part.get("block_summary", ())
+        ),
+        posture=_first_nonempty(part.get("posture", "") for part in parts),
     )
 
 
@@ -525,6 +590,8 @@ def evaluate_profile_post_adaptation(
     learning_rate: float = EEG_MODEL_LR,
     pose_checkpoint: str | Path | None = POSE_ENCODING_MODEL,
     device: str | torch.device = DEFAULT_DEVICE,
+    progress: _ProfileBuildProgress | None = None,
+    progress_phase: str = "evaluating profile",
 ) -> list[PostAdaptationMetrics]:
     metrics = []
     pose_decoder = _load_pose_decoder(
@@ -532,7 +599,12 @@ def evaluate_profile_post_adaptation(
         pose_latent_dim=sessions[0].pose_latent.shape[1],
         device=device,
     )
-    for session in sessions:
+    for session_index, session in enumerate(sessions):
+        if progress is not None:
+            progress.start(
+                f"{progress_phase}, session "
+                f"{session_index + 1}/{len(sessions)} ({session.name})"
+            )
         model = _load_raw_model(checkpoint, device)
         reset_band_adapter_identity(model)
         _train_model_on_session_split(
@@ -555,6 +627,8 @@ def evaluate_profile_post_adaptation(
                 device=device,
             )
         )
+        if progress is not None:
+            progress.finish_step()
     return metrics
 
 
@@ -684,7 +758,18 @@ def _profile_session_source_paths(
 
 def _load_profile_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path) as archive:
-        return {
+        accepted_mask = (
+            np.asarray(archive["profile_block_accepted"], dtype=bool)
+            if "profile_block_accepted" in archive.files
+            else None
+        )
+        block_summary = _load_block_summary_json(archive)
+        posture = (
+            str(np.asarray(archive["profile_posture"]).item())
+            if "profile_posture" in archive.files
+            else ""
+        )
+        arrays = {
             "eeg": np.asarray(archive["eeg"], dtype=np.float32),
             "pose_latent": np.asarray(archive["pose_latent"], dtype=np.float32),
             "pose_confidence": np.asarray(archive["pose_confidence"], dtype=np.float32),
@@ -697,6 +782,87 @@ def _load_profile_arrays(path: Path) -> dict[str, np.ndarray]:
                 dtype=np.float32,
             ),
         }
+        if "profile_block_id" in archive.files:
+            arrays["block_id"] = np.asarray(archive["profile_block_id"], dtype=np.int64)
+        if accepted_mask is not None:
+            arrays = {
+                key: value[accepted_mask]
+                for key, value in arrays.items()
+            }
+        arrays["block_summary"] = block_summary
+        arrays["posture"] = posture
+        return arrays
+
+
+def _load_block_summary_json(
+    archive: np.lib.npyio.NpzFile,
+) -> tuple[dict[str, object], ...]:
+    if "profile_block_summary_json" not in archive.files:
+        return ()
+    raw = np.asarray(archive["profile_block_summary_json"]).item()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    return tuple(json.loads(str(raw)))
+
+
+def _merged_block_ids(parts: list[dict[str, np.ndarray]]) -> np.ndarray | None:
+    if not all("block_id" in part for part in parts):
+        return None
+    merged = []
+    offset = 0
+    for part in parts:
+        block_ids = np.asarray(part["block_id"], dtype=np.int64)
+        if len(block_ids) == 0:
+            continue
+        merged.append(block_ids + offset)
+        offset += int(np.max(block_ids)) + 1
+    if not merged:
+        return None
+    return np.concatenate(merged).astype(np.int64, copy=False)
+
+
+def _first_nonempty(values) -> str:
+    for value in values:
+        if value:
+            return str(value)
+    return ""
+
+
+def _summarize_profile_session_blocks(
+    session: ProfileSession,
+) -> dict[str, object]:
+    accepted = [
+        summary
+        for summary in session.block_summary
+        if bool(summary.get("accepted", False))
+    ]
+    rejected = [
+        summary
+        for summary in session.block_summary
+        if not bool(summary.get("accepted", False))
+    ]
+    movement_counts: dict[str, int] = {}
+    for summary in accepted:
+        name = str(summary.get("movement_name", "unknown"))
+        movement_counts[name] = movement_counts.get(name, 0) + 1
+    return {
+        "posture": session.posture,
+        "accepted_block_count": len(accepted),
+        "rejected_block_count": len(rejected),
+        "accepted_sample_count": int(len(session.eeg)),
+        "movement_counts": movement_counts,
+        "reject_reasons": _reject_reason_counts(rejected),
+    }
+
+
+def _reject_reason_counts(
+    rejected: list[dict[str, object]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for summary in rejected:
+        reason = str(summary.get("reject_reason", "unknown") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
 
 
 def _support_query_indices(
@@ -734,6 +900,42 @@ def _support_query_indices_for_files(
         [np.arange(starts[i], starts[i] + lengths[i]) for i in query_files],
     )
     return support.astype(np.int64), query.astype(np.int64)
+
+
+def _support_query_indices_for_blocks(
+    block_ids: np.ndarray,
+    *,
+    query_fraction: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    unique_blocks = _unique_in_order(block_ids)
+    if len(unique_blocks) < 2:
+        return _support_query_indices(len(block_ids), query_fraction=query_fraction)
+
+    query_block_count = min(
+        max(1, round(len(unique_blocks) * query_fraction)),
+        len(unique_blocks) - 1,
+    )
+    query_blocks = set(unique_blocks[-query_block_count:])
+    support_mask = np.asarray(
+        [block_id not in query_blocks for block_id in block_ids],
+        dtype=bool,
+    )
+    query_mask = ~support_mask
+    return (
+        np.flatnonzero(support_mask).astype(np.int64),
+        np.flatnonzero(query_mask).astype(np.int64),
+    )
+
+
+def _unique_in_order(values: np.ndarray) -> list[int]:
+    seen: set[int] = set()
+    ordered = []
+    for value in values:
+        int_value = int(value)
+        if int_value not in seen:
+            ordered.append(int_value)
+            seen.add(int_value)
+    return ordered
 
 
 def _safe_name(value: str) -> str:
@@ -956,6 +1158,7 @@ def _write_profile_build_report(history_root: Path, report: ProfileBuildReport) 
                 else None
             ),
             "session_metrics": [asdict(metric) for metric in report.session_metrics],
+            "session_block_summaries": report.session_block_summaries,
         },
     )
     old_by_session = {
