@@ -23,7 +23,7 @@ class InterpolatedPoseLatent:
 
 
 class PoseLatentBuffer:
-    """Keep recent pose latents and interpolate truth labels by monotonic time."""
+    """Keep recent pose latents and interpolate truth labels by monotonic camera capture time."""
 
     def __init__(
         self,
@@ -47,7 +47,7 @@ class PoseLatentBuffer:
     def latest_time_s(self) -> float | None:
         if not self._frames:
             return None
-        return self._frames[-1].received_time_s
+        return self._frames[-1].timestamp_ms / 1000.0
 
     def latent_at(self, target_time_s: float) -> InterpolatedPoseLatent | None:
         if len(self._frames) < 2:
@@ -56,7 +56,7 @@ class PoseLatentBuffer:
         before: PoseLatentFrame | None = None
         after: PoseLatentFrame | None = None
         for frame in self._frames:
-            if frame.received_time_s <= target_time_s:
+            if frame.timestamp_ms / 1000.0 <= target_time_s:
                 before = frame
                 continue
             after = frame
@@ -65,11 +65,11 @@ class PoseLatentBuffer:
         if before is None or after is None:
             return None
 
-        gap_s = after.received_time_s - before.received_time_s
+        gap_s = (after.timestamp_ms - before.timestamp_ms) / 1000.0
         if gap_s <= 0 or gap_s > self.max_gap_s:
             return None
 
-        alpha = (target_time_s - before.received_time_s) / gap_s
+        alpha = (target_time_s - before.timestamp_ms / 1000.0) / gap_s
         latent = ((1.0 - alpha) * before.latent + alpha * after.latent).astype(
             np.float32,
             copy=False,

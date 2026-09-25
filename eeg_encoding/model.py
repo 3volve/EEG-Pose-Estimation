@@ -72,6 +72,12 @@ class EegPoseModelConfig:
     standardize_input: bool = EEG_WAVELET_STANDARDIZE_INPUT
     use_band_adapter: bool = EEG_USE_BAND_ADAPTER
     wavelet_band_lengths: tuple[int, ...] | None = None
+    pipeline_version: str = "legacy-first-four-unfiltered"
+    source_channel_indices: tuple[int, ...] = (0, 1, 2, 3)
+    sample_rate_hz: int = 250
+    bandstop_low_hz: float | None = None
+    bandstop_high_hz: float | None = None
+    bandstop_order: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +425,99 @@ def build_context_windows(
     return np.stack(windows, axis=0).astype(np.float32, copy=False)
 
 
+def build_grouped_context_windows(
+    eeg_features: np.ndarray,
+    group_ids: np.ndarray,
+    *,
+    context_packet_count: int,
+) -> np.ndarray:
+    """Build causal contexts without carrying history across group boundaries."""
+    assert eeg_features.ndim == 3
+    group_ids = np.asarray(group_ids)
+    if len(eeg_features) != len(group_ids):
+        raise ValueError(
+            "EEG feature and context-group lengths differ: "
+            f"{len(eeg_features)} != {len(group_ids)}."
+        )
+    if len(eeg_features) == 0:
+        raise ValueError("Cannot build EEG contexts from an empty array.")
+
+    contexts = np.empty(
+        (
+            len(eeg_features),
+            context_packet_count,
+            eeg_features.shape[1],
+            eeg_features.shape[2],
+        ),
+        dtype=np.float32,
+    )
+    start = 0
+    while start < len(eeg_features):
+        end = start + 1
+        while end < len(eeg_features) and group_ids[end] == group_ids[start]:
+            end += 1
+        contexts[start:end] = build_context_windows(
+            eeg_features[start:end],
+            context_packet_count=context_packet_count,
+        )
+        start = end
+    return contexts
+
+
+def build_eligible_grouped_context_windows(
+    eeg_features: np.ndarray,
+    group_ids: np.ndarray,
+    target_trusted: np.ndarray,
+    history_eligible: np.ndarray,
+    *,
+    context_packet_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build target contexts while preserving trusted-independent EEG history.
+
+    Untrusted target rows remain in history. Rows excluded at a split boundary
+    are removed from history, and the first subsequent eligible row starts a new
+    context segment even when its group label happens to be unchanged.
+    """
+    group_ids = np.asarray(group_ids)
+    target_trusted = np.asarray(target_trusted, dtype=bool)
+    history_eligible = np.asarray(history_eligible, dtype=bool)
+    expected_length = len(eeg_features)
+    for name, values in (
+        ("context groups", group_ids),
+        ("target trust", target_trusted),
+        ("history eligibility", history_eligible),
+    ):
+        if values.shape != (expected_length,):
+            raise ValueError(
+                f"EEG {name} must have shape ({expected_length},), got "
+                f"{values.shape}."
+            )
+
+    history_indices = np.flatnonzero(history_eligible).astype(np.int64)
+    if len(history_indices) == 0:
+        raise ValueError("No split-eligible EEG rows are available for context history.")
+
+    segment_ids = np.zeros(len(history_indices), dtype=np.int64)
+    segment_id = 0
+    for index in range(1, len(history_indices)):
+        current_source_index = history_indices[index]
+        previous_source_index = history_indices[index - 1]
+        if (
+            current_source_index != previous_source_index + 1
+            or group_ids[current_source_index] != group_ids[previous_source_index]
+        ):
+            segment_id += 1
+        segment_ids[index] = segment_id
+
+    history_contexts = build_grouped_context_windows(
+        eeg_features[history_indices],
+        segment_ids,
+        context_packet_count=context_packet_count,
+    )
+    selected_targets = target_trusted[history_indices]
+    return history_contexts[selected_targets], history_indices[selected_targets]
+
+
 def standardize_pose_latents(
     pose_latents: np.ndarray,
     config: EegPoseModelConfig,
@@ -597,23 +696,118 @@ def train_model(
     eeg_parts = []
     pose_latent_parts = []
     group_parts = []
+    role_parts: list[np.ndarray] = []
+    context_group_parts: list[np.ndarray] = []
+    context_target_trusted_parts: list[np.ndarray] = []
+    context_history_eligible_parts: list[np.ndarray] = []
+    has_recorded_roles: bool | None = None
+    preprocessing_signature: dict[str, object] | None = None
     resolved_dataset_paths = []
     for resolved_path in _resolve_dataset_paths(dataset_path):
         resolved_dataset_paths.append(str(resolved_path))
         with np.load(resolved_path) as dataset:
-            eeg_parts.append(np.asarray(dataset["eeg"], dtype=np.float32))
-            pose_latent_parts.append(np.asarray(dataset["pose_latent"], dtype=np.float32))
+            dataset_signature = preprocessing_signature_from_archive(dataset)
+            if preprocessing_signature is None:
+                preprocessing_signature = dataset_signature
+            else:
+                require_matching_preprocessing(
+                    preprocessing_signature,
+                    dataset_signature,
+                    source=str(resolved_path),
+                )
+            raw_part = np.asarray(dataset["eeg"], dtype=np.float32)
+            pose_part = np.asarray(dataset["pose_latent"], dtype=np.float32)
+            if len(pose_part) != len(raw_part):
+                raise ValueError(
+                    f"EEG and pose target lengths differ in {resolved_path}: "
+                    f"{len(raw_part)} != {len(pose_part)}."
+                )
+            roles_present = "profile_round_role" in dataset.files
+            if has_recorded_roles is None:
+                has_recorded_roles = roles_present
+            elif has_recorded_roles != roles_present:
+                raise ValueError(
+                    "Cannot mix paired EEG archives with and without recorded "
+                    "profile round roles."
+                )
+            if roles_present:
+                roles = np.asarray(dataset["profile_round_role"]).astype(str)
+                if len(roles) != len(raw_part):
+                    raise ValueError(
+                        f"Round-role length mismatch in {resolved_path}: "
+                        f"{len(roles)} roles for {len(raw_part)} EEG frames."
+                    )
+                unknown_part_roles = sorted(
+                    set(roles.tolist())
+                    - {"support", "query", "validation", "test"}
+                )
+                if unknown_part_roles:
+                    raise ValueError(
+                        f"Unknown profile round roles in {resolved_path}: "
+                        f"{unknown_part_roles}."
+                    )
+                target_trusted = (
+                    np.asarray(dataset["profile_frame_trusted"], dtype=bool)
+                    if "profile_frame_trusted" in dataset.files
+                    else np.ones(len(raw_part), dtype=bool)
+                )
+                history_eligible = (
+                    np.asarray(
+                        dataset["profile_frame_split_eligible"],
+                        dtype=bool,
+                    )
+                    if "profile_frame_split_eligible" in dataset.files
+                    else np.ones(len(raw_part), dtype=bool)
+                )
+                if len(target_trusted) != len(raw_part):
+                    raise ValueError(
+                        f"Frame-trust length mismatch in {resolved_path}: "
+                        f"{len(target_trusted)} flags for {len(raw_part)} EEG frames."
+                    )
+                if len(history_eligible) != len(raw_part):
+                    raise ValueError(
+                        f"Split-eligibility length mismatch in {resolved_path}: "
+                        f"{len(history_eligible)} flags for {len(raw_part)} EEG frames."
+                    )
+                target_mask = target_trusted & history_eligible
+                pose_part = pose_part[target_mask]
+                role_parts.append(roles[target_mask])
+                context_group_parts.append(roles)
+                context_target_trusted_parts.append(target_trusted)
+                context_history_eligible_parts.append(history_eligible)
+            eeg_parts.append(raw_part)
+            pose_latent_parts.append(pose_part)
             group_parts.append(
-                np.full(len(dataset["eeg"]), resolved_path.name, dtype=object)
+                np.full(len(pose_part), resolved_path.name, dtype=object)
             )
+    if not eeg_parts:
+        raise ValueError("No paired EEG archives matched the requested dataset path.")
+    assert preprocessing_signature is not None
     raw_eeg = np.concatenate(eeg_parts, axis=0)
     pose_latent = np.concatenate(pose_latent_parts, axis=0)
     group_ids = np.concatenate(group_parts, axis=0)
-    train_indices, validation_indices = (
-        _split_indices_by_group(group_ids, val_split, seed)
-        if validate_by_run
-        else _split_indices(len(group_ids), val_split, seed)
-    )
+    if has_recorded_roles:
+        roles = np.concatenate(role_parts, axis=0)
+        unknown_roles = sorted(
+            set(roles.tolist()) - {"support", "query", "validation", "test"}
+        )
+        if unknown_roles:
+            raise ValueError(f"Unknown profile round roles: {unknown_roles}.")
+        train_indices = np.flatnonzero(
+            np.isin(roles, ("support", "query"))
+        ).astype(np.int64)
+        validation_indices = np.flatnonzero(roles == "validation").astype(np.int64)
+        if len(train_indices) == 0 or len(validation_indices) == 0:
+            raise ValueError(
+                "Recorded four-round data must contain trusted support/query "
+                "training frames and trusted validation frames."
+            )
+    else:
+        train_indices, validation_indices = (
+            _split_indices_by_group(group_ids, val_split, seed)
+            if validate_by_run
+            else _split_indices(len(group_ids), val_split, seed)
+        )
 
     torch.manual_seed(seed)
     if checkpoint_path is None:
@@ -665,11 +859,37 @@ def train_model(
             standardize_input=standardize_input,
             use_band_adapter=use_band_adapter,
             wavelet_band_lengths=band_lengths,
+            pipeline_version=str(preprocessing_signature["pipeline_version"]),
+            source_channel_indices=tuple(
+                int(value)
+                for value in preprocessing_signature["source_channel_indices"]
+            ),
+            sample_rate_hz=int(preprocessing_signature["sample_rate_hz"]),
+            bandstop_low_hz=(
+                float(preprocessing_signature["bandstop_low_hz"])
+                if preprocessing_signature["bandstop_low_hz"] is not None
+                else None
+            ),
+            bandstop_high_hz=(
+                float(preprocessing_signature["bandstop_high_hz"])
+                if preprocessing_signature["bandstop_high_hz"] is not None
+                else None
+            ),
+            bandstop_order=(
+                int(preprocessing_signature["bandstop_order"])
+                if preprocessing_signature["bandstop_order"] is not None
+                else None
+            ),
         )
         model = EegPoseVAE(config).to(device)
     else:
         model = _load_raw_model(checkpoint_path, device)
         config = model.config
+        require_matching_preprocessing(
+            preprocessing_signature_from_config(config),
+            preprocessing_signature,
+            source=str(checkpoint_path),
+        )
         if (
             config.n_channels != raw_eeg.shape[1]
             or config.n_samples != raw_eeg.shape[2]
@@ -681,13 +901,23 @@ def train_model(
                 f"and pose latent {config.pose_latent_dim}; dataset has EEG "
                 f"({raw_eeg.shape[1]}, {raw_eeg.shape[2]}) and pose latent {pose_latent.shape[1]}."
             )
-    transformed_parts = [
-        build_context_windows(
-            transform_eeg_for_model(raw_part, config),
-            context_packet_count=config.context_packet_count,
+    transformed_parts = []
+    for part_index, raw_part in enumerate(eeg_parts):
+        features = transform_eeg_for_model(raw_part, config)
+        transformed_parts.append(
+            build_eligible_grouped_context_windows(
+                features,
+                context_group_parts[part_index],
+                context_target_trusted_parts[part_index],
+                context_history_eligible_parts[part_index],
+                context_packet_count=config.context_packet_count,
+            )[0]
+            if has_recorded_roles
+            else build_context_windows(
+                features,
+                context_packet_count=config.context_packet_count,
+            )
         )
-        for raw_part in eeg_parts
-    ]
     eeg = np.concatenate(transformed_parts, axis=0)
     pose_latent_model_target = standardize_pose_latents(pose_latent, config)
     pose_decoder = _load_pose_decoder(
@@ -723,6 +953,9 @@ def train_model(
         generator=torch.Generator().manual_seed(seed),
     )
 
+    baseline_pose_latent = pose_latent[train_indices].mean(axis=0)
+    best_validation_mae = float("inf")
+    best_state: dict[str, Tensor] | None = None
     for _ in range(epochs):
         model.train()
         for batch_eeg, batch_pose_latent_target, batch_pose_latent_raw in loader:
@@ -765,6 +998,25 @@ def train_model(
             )
             loss.backward()
             optimizer.step()
+        if len(validation_indices) > 0:
+            validation_epoch_report = _evaluate_split(
+                model,
+                eeg[validation_indices],
+                pose_latent[validation_indices],
+                config=config,
+                baseline_pose_latent=baseline_pose_latent,
+                device=device,
+            )
+            if validation_epoch_report.pose_mae < best_validation_mae:
+                best_validation_mae = validation_epoch_report.pose_mae
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        model.to(device)
 
     save_model(out_path, model)
     train_report = _evaluate_split(
@@ -772,7 +1024,7 @@ def train_model(
         eeg[train_indices],
         pose_latent[train_indices],
         config=config,
-        baseline_pose_latent=pose_latent[train_indices].mean(axis=0),
+        baseline_pose_latent=baseline_pose_latent,
         device=device,
     )
     validation_report = (
@@ -781,7 +1033,7 @@ def train_model(
             eeg[validation_indices],
             pose_latent[validation_indices],
             config=config,
-            baseline_pose_latent=pose_latent[train_indices].mean(axis=0),
+            baseline_pose_latent=baseline_pose_latent,
             device=device,
         )
         if len(validation_indices) > 0
@@ -839,6 +1091,12 @@ def save_model(path: str | Path, model: EegPoseVAE) -> None:
                 "standardize_input": config.standardize_input,
                 "use_band_adapter": config.use_band_adapter,
                 "wavelet_band_lengths": config.wavelet_band_lengths,
+                "pipeline_version": config.pipeline_version,
+                "source_channel_indices": config.source_channel_indices,
+                "sample_rate_hz": config.sample_rate_hz,
+                "bandstop_low_hz": config.bandstop_low_hz,
+                "bandstop_high_hz": config.bandstop_high_hz,
+                "bandstop_order": config.bandstop_order,
             },
         },
         output_path,
@@ -863,6 +1121,86 @@ def _load_raw_model(
     model = EegPoseVAE(config)
     model.load_state_dict(checkpoint["state_dict"])
     return model.to(device)
+
+
+_PREPROCESSING_SIGNATURE_KEYS = (
+    "pipeline_version",
+    "source_channel_indices",
+    "sample_rate_hz",
+    "bandstop_low_hz",
+    "bandstop_high_hz",
+    "bandstop_order",
+)
+
+
+def preprocessing_signature_from_config(
+    config: EegPoseModelConfig,
+) -> dict[str, object]:
+    return {
+        "pipeline_version": config.pipeline_version,
+        "source_channel_indices": config.source_channel_indices,
+        "sample_rate_hz": config.sample_rate_hz,
+        "bandstop_low_hz": config.bandstop_low_hz,
+        "bandstop_high_hz": config.bandstop_high_hz,
+        "bandstop_order": config.bandstop_order,
+    }
+
+
+def preprocessing_signature_from_archive(
+    archive: np.lib.npyio.NpzFile,
+) -> dict[str, object]:
+    present = [key for key in _PREPROCESSING_SIGNATURE_KEYS if key in archive.files]
+    if not present:
+        return {
+            "pipeline_version": "legacy-first-four-unfiltered",
+            "source_channel_indices": (0, 1, 2, 3),
+            "sample_rate_hz": 250,
+            "bandstop_low_hz": None,
+            "bandstop_high_hz": None,
+            "bandstop_order": None,
+        }
+    missing = [key for key in _PREPROCESSING_SIGNATURE_KEYS if key not in archive.files]
+    if missing:
+        raise ValueError(
+            "Paired EEG archive has an incomplete preprocessing signature; "
+            f"missing {missing}."
+        )
+
+    def scalar(key: str) -> object:
+        return np.asarray(archive[key]).item()
+
+    low_hz = scalar("bandstop_low_hz")
+    high_hz = scalar("bandstop_high_hz")
+    order = scalar("bandstop_order")
+    return {
+        "pipeline_version": str(scalar("pipeline_version")),
+        "source_channel_indices": tuple(
+            int(value) for value in np.asarray(archive["source_channel_indices"]).tolist()
+        ),
+        "sample_rate_hz": int(scalar("sample_rate_hz")),
+        "bandstop_low_hz": float(low_hz) if low_hz is not None else None,
+        "bandstop_high_hz": float(high_hz) if high_hz is not None else None,
+        "bandstop_order": int(order) if order is not None else None,
+    }
+
+
+def require_matching_preprocessing(
+    expected: dict[str, object],
+    actual: dict[str, object],
+    *,
+    source: str,
+) -> None:
+    if expected == actual:
+        return
+    differences = {
+        key: {"expected": expected.get(key), "actual": actual.get(key)}
+        for key in _PREPROCESSING_SIGNATURE_KEYS
+        if expected.get(key) != actual.get(key)
+    }
+    raise ValueError(
+        f"EEG preprocessing mismatch at {source}: {differences}. "
+        "Do not mix legacy and corrected EEG data or checkpoints."
+    )
 
 
 def _resolve_dataset_path(path: str | Path) -> Path:

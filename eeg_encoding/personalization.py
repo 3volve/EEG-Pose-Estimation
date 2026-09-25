@@ -5,7 +5,8 @@ import csv
 import glob
 import json
 import shutil
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -53,9 +54,12 @@ from config import (
 from .model import (
     EegPoseVAE,
     EegTrainingReport,
-    build_context_windows,
+    build_eligible_grouped_context_windows,
     decoded_pose_training_loss,
     format_training_report,
+    preprocessing_signature_from_archive,
+    preprocessing_signature_from_config,
+    require_matching_preprocessing,
     reset_band_adapter_identity,
     save_model,
     set_trainable_scope,
@@ -66,6 +70,19 @@ from .model import (
     _load_pose_decoder,
     _load_raw_model,
 )
+from .permanent_holdout import (
+    HoldoutSlot,
+    HoldoutUpdate,
+    PermanentHoldoutManifest,
+    canonical_preprocessing_signature,
+    candidates_from_test_blocks,
+    checksum_archive_rows,
+    checksum_preprocessing_signature,
+    load_manifest,
+    replace_next_slot_after_decision,
+    require_complete_manifest,
+    seed_manifest_from_first_session,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +91,8 @@ class ProfilePaths:
     profile_model: Path
     history_root: Path
     sessions_root: Path
+    holdout_root: Path
+    holdout_manifest: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +124,18 @@ class ProfileSession:
     pose_reconstruction_error: np.ndarray
     support_indices: np.ndarray
     query_indices: np.ndarray
+    validation_indices: np.ndarray
+    test_indices: np.ndarray
+    round_roles: np.ndarray
+    target_eligible: np.ndarray
+    history_eligible: np.ndarray
     block_ids: np.ndarray | None = None
+    block_names: np.ndarray | None = None
+    block_is_rest: np.ndarray | None = None
+    block_accepted: np.ndarray | None = None
     block_summary: tuple[dict[str, object], ...] = ()
     posture: str = ""
+    preprocessing_signature: dict[str, object] | None = None
 
 
 class _ProfileBuildProgress:
@@ -155,6 +183,12 @@ class ProfileBuildReport:
     old_session_metrics: tuple[PostAdaptationMetrics, ...] | None
     session_metrics: tuple[PostAdaptationMetrics, ...]
     session_block_summaries: dict[str, dict[str, object]]
+    validation_passed: bool = True
+    holdout_passed: bool = True
+    old_holdout_metrics: dict[str, float] | None = None
+    new_holdout_metrics: dict[str, float] | None = None
+    test_metrics: tuple[PostAdaptationMetrics, ...] = ()
+    holdout_update: dict[str, object] | None = None
 
 
 def profile_paths(
@@ -168,6 +202,8 @@ def profile_paths(
         profile_model=root / "profile_model.pt",
         history_root=root / "profile_history",
         sessions_root=root / "sessions",
+        holdout_root=root / "permanent_holdout",
+        holdout_manifest=root / "permanent_holdout" / "manifest.json",
     )
 
 
@@ -337,6 +373,32 @@ def should_commit_profile_update(
     return True
 
 
+def profile_update_gate(
+    old_validation_metrics: dict[str, float],
+    new_validation_metrics: dict[str, float],
+    old_holdout_metrics: dict[str, float] | None,
+    new_holdout_metrics: dict[str, float] | None,
+    *,
+    holdout_expected: bool = False,
+) -> tuple[bool, bool, bool]:
+    validation_passed = should_commit_profile_update(
+        old_validation_metrics,
+        new_validation_metrics,
+    )
+    if old_holdout_metrics is None or new_holdout_metrics is None:
+        holdout_passed = not holdout_expected
+    else:
+        holdout_passed = should_commit_profile_update(
+            old_holdout_metrics,
+            new_holdout_metrics,
+        )
+    return (
+        validation_passed and holdout_passed,
+        validation_passed,
+        holdout_passed,
+    )
+
+
 def profile_start_checkpoint(
     user_id: str,
     fallback_checkpoint: str | Path,
@@ -375,6 +437,22 @@ def install_profile_model(
     return paths.profile_model
 
 
+def seed_profile_holdout(
+    *,
+    user_id: str,
+    session_archive: str | Path,
+    profiles_root: str | Path = EEG_PROFILES_ROOT,
+) -> PermanentHoldoutManifest:
+    paths = profile_paths(user_id, profiles_root=profiles_root)
+    candidates = _holdout_candidates_for_archives([Path(session_archive)])
+    if not candidates:
+        raise ValueError(
+            "Cannot seed the permanent holdout because the session has no "
+            "eligible fourth-round blocks."
+        )
+    return seed_manifest_from_first_session(paths.holdout_manifest, candidates)
+
+
 def build_profile_model(
     *,
     user_id: str,
@@ -394,51 +472,128 @@ def build_profile_model(
     paths = profile_paths(user_id, profiles_root=profiles_root)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     history_root = paths.history_root / timestamp
-    history_root.mkdir(parents=True, exist_ok=True)
-    paths.root.mkdir(parents=True, exist_ok=True)
 
-    _write_profile_session_archives(
-        new_session_data,
-        history_root=paths.history_root,
-        batch_id=timestamp,
-    )
-    session_roots = _profile_session_roots(paths.history_root)
-    sessions = [
-        load_profile_session(root, query_fraction=query_fraction)
-        for root in session_roots
-    ]
-    has_existing_profile = paths.profile_model.exists()
-    progress = _ProfileBuildProgress(
-        total_steps=(
-            (len(sessions) if has_existing_profile else 0)
-            + epochs * len(sessions)
-            + len(sessions)
-            + 1
+    # Validate the incoming sources before copying them into permanent history.
+    session_groups = _resolve_profile_session_groups(new_session_data)
+    if not session_groups or any(not source_paths for _, source_paths in session_groups):
+        raise ValueError("Profile build requires at least one captured session.")
+    staged_current_sessions = [
+        load_profile_session(
+            source_paths if len(source_paths) > 1 else source_paths[0],
+            query_fraction=query_fraction,
         )
-    )
-
+        for _, source_paths in session_groups
+    ]
+    existing_session_roots = _profile_session_roots(paths.history_root)
+    existing_sessions = [
+        load_profile_session(root, query_fraction=query_fraction)
+        for root in existing_session_roots
+    ]
     start_checkpoint = profile_start_checkpoint(
         user_id,
         base_checkpoint,
         profiles_root=profiles_root,
     )
-    old_metrics = None
-    old_session_metrics = None
-    if has_existing_profile:
-        progress.start("loading the evaluator for the existing profile")
-        old_session_metrics = evaluate_profile_post_adaptation(
-            paths.profile_model,
-            sessions,
-            inner_adaptation_mode=inner_adaptation_mode,
-            inner_epochs=inner_epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-            pose_checkpoint=pose_checkpoint,
-            device=device,
-            progress=progress,
-            progress_phase="evaluating existing profile",
+    start_model = _load_raw_model(start_checkpoint, device)
+    start_signature = preprocessing_signature_from_config(start_model.config)
+    for session in [*existing_sessions, *staged_current_sessions]:
+        assert session.preprocessing_signature is not None
+        require_matching_preprocessing(
+            start_signature,
+            session.preprocessing_signature,
+            source=f"profile session {session.name}",
         )
-        old_metrics = summarize_post_adaptation_metrics(old_session_metrics)
+    del start_model
+
+    has_explicit_test_round = any(
+        len(session.test_indices) > 0
+        for session in staged_current_sessions
+    )
+    manifest_snapshot = None
+    if has_explicit_test_round:
+        multi_source_groups = [
+            name
+            for name, source_paths in session_groups
+            if len(source_paths) > 1
+        ]
+        if multi_source_groups:
+            raise ValueError(
+                "Permanent holdout provenance requires one archive per profile "
+                f"session; multi-source groups: {multi_source_groups}."
+            )
+        if not paths.holdout_manifest.exists():
+            raise RuntimeError(
+                "A four-round profile build requires an existing complete "
+                "permanent holdout; run bootstrap-base first."
+            )
+        manifest_snapshot = load_manifest(paths.holdout_manifest)
+        require_complete_manifest(
+            manifest_snapshot,
+            source=paths.holdout_manifest,
+        )
+    elif paths.holdout_manifest.exists():
+        # Legacy no-role sessions remain supported for direct research tests, but
+        # an existing corrected holdout must still be complete and active.
+        manifest_snapshot = load_manifest(paths.holdout_manifest)
+        require_complete_manifest(
+            manifest_snapshot,
+            source=paths.holdout_manifest,
+        )
+
+    if manifest_snapshot is not None:
+        canonical_start_signature = canonical_preprocessing_signature(
+            start_signature
+        )
+        start_signature_checksum = checksum_preprocessing_signature(
+            canonical_start_signature
+        )
+        if (
+            manifest_snapshot.preprocessing_signature
+            != canonical_start_signature
+            or manifest_snapshot.preprocessing_checksum
+            != start_signature_checksum
+        ):
+            raise ValueError(
+                "Permanent holdout preprocessing does not match the starting "
+                "profile checkpoint. Rebuild the holdout from data captured "
+                "with the checkpoint preprocessing."
+            )
+
+    history_root.mkdir(parents=True, exist_ok=True)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    new_session_roots = _write_profile_session_archives(
+        new_session_data,
+        history_root=paths.history_root,
+        batch_id=timestamp,
+    )
+    current_sessions = [
+        load_profile_session(root, query_fraction=query_fraction)
+        for root in new_session_roots
+    ]
+    sessions = [*existing_sessions, *current_sessions]
+    current_archive_paths = [
+        root / "paired_profile_session.npz"
+        for root in new_session_roots
+    ]
+    progress = _ProfileBuildProgress(
+        total_steps=max(1, epochs * len(sessions) + 5)
+    )
+
+    progress.start("evaluating the starting profile on validation rounds")
+    old_session_metrics = evaluate_profile_post_adaptation(
+        start_checkpoint,
+        current_sessions,
+        inner_adaptation_mode=inner_adaptation_mode,
+        inner_epochs=inner_epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        pose_checkpoint=pose_checkpoint,
+        device=device,
+        evaluation_role="validation",
+        adaptation_seed=0,
+    )
+    old_metrics = summarize_post_adaptation_metrics(old_session_metrics)
+    progress.finish_step()
 
     progress.start("loading the starting model and pose decoder")
     proposed_model = _load_raw_model(start_checkpoint, device)
@@ -448,6 +603,8 @@ def build_profile_model(
         pose_latent_dim=sessions[0].pose_latent.shape[1],
         device=device,
     )
+    best_profile_state = copy.deepcopy(proposed_model.state_dict())
+    best_validation_error: float | None = None
     for epoch_index in range(epochs):
         for session_index, session in enumerate(sessions):
             progress.start(
@@ -481,54 +638,203 @@ def build_profile_model(
             _copy_profile_core_state(session_model, proposed_model)
             reset_band_adapter_identity(proposed_model)
             progress.finish_step()
+        epoch_validation_metrics = _evaluate_profile_model_post_adaptation(
+            proposed_model,
+            current_sessions,
+            inner_adaptation_mode=inner_adaptation_mode,
+            inner_epochs=inner_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            pose_decoder=pose_decoder,
+            device=device,
+            evaluation_role="validation",
+            adaptation_seed=0,
+        )
+        epoch_validation = summarize_post_adaptation_metrics(
+            epoch_validation_metrics
+        )
+        validation_error = epoch_validation["decoded_pose_error"]
+        if not np.isfinite(validation_error):
+            raise ValueError(
+                f"Outer epoch {epoch_index + 1} produced non-finite "
+                "validation decoded-pose error."
+            )
+        if (
+            best_validation_error is None
+            or validation_error < best_validation_error
+        ):
+            best_validation_error = validation_error
+            best_profile_state = copy.deepcopy(proposed_model.state_dict())
+
+    proposed_model.load_state_dict(best_profile_state)
+    reset_band_adapter_identity(proposed_model)
 
     proposed_model_path = history_root / "proposed_profile_model.pt"
     reset_band_adapter_identity(proposed_model)
-    progress.start("saving the proposed model and loading its evaluator")
+    progress.start("saving and validating the proposed profile")
     save_model(proposed_model_path, proposed_model)
     session_metrics = evaluate_profile_post_adaptation(
         proposed_model_path,
-        sessions,
+        current_sessions,
         inner_adaptation_mode=inner_adaptation_mode,
         inner_epochs=inner_epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
         pose_checkpoint=pose_checkpoint,
         device=device,
-        progress=progress,
-        progress_phase="evaluating proposed profile",
+        evaluation_role="validation",
+        adaptation_seed=0,
     )
     new_metrics = summarize_post_adaptation_metrics(session_metrics)
-    progress.start("comparing metrics, saving the profile, and writing the report")
-    committed = should_commit_profile_update(old_metrics, new_metrics)
-    if committed:
-        shutil.copy2(proposed_model_path, paths.profile_model)
-        _write_json(
-            paths.root / "profile_metrics.json",
-            {
-                "metrics": new_metrics,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-            },
-        )
+    progress.finish_step()
 
-    report = ProfileBuildReport(
-        user_id=user_id,
-        profile_model=str(paths.profile_model),
-        proposed_model=str(proposed_model_path),
-        committed=committed,
-        start_checkpoint=str(start_checkpoint),
-        history_dir=str(history_root),
-        session_count=len(sessions),
-        old_metrics=old_metrics,
-        new_metrics=new_metrics,
-        old_session_metrics=tuple(old_session_metrics) if old_session_metrics else None,
-        session_metrics=tuple(session_metrics),
-        session_block_summaries={
-            session.name: _summarize_profile_session_blocks(session)
-            for session in sessions
-        },
+    old_holdout_metrics = None
+    new_holdout_metrics = None
+    holdout_passed = True
+    if manifest_snapshot is not None:
+        progress.start("evaluating the permanent holdout snapshot")
+        old_holdout_session_metrics = evaluate_permanent_holdout(
+            start_checkpoint,
+            manifest_snapshot,
+            inner_adaptation_mode=inner_adaptation_mode,
+            inner_epochs=inner_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            pose_checkpoint=pose_checkpoint,
+            device=device,
+            adaptation_seed=0,
+        )
+        new_holdout_session_metrics = evaluate_permanent_holdout(
+            proposed_model_path,
+            manifest_snapshot,
+            inner_adaptation_mode=inner_adaptation_mode,
+            inner_epochs=inner_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            pose_checkpoint=pose_checkpoint,
+            device=device,
+            adaptation_seed=0,
+        )
+        if old_holdout_session_metrics and new_holdout_session_metrics:
+            old_holdout_metrics = summarize_permanent_holdout_metrics(
+                old_holdout_session_metrics,
+                manifest_snapshot,
+            )
+            new_holdout_metrics = summarize_permanent_holdout_metrics(
+                new_holdout_session_metrics,
+                manifest_snapshot,
+            )
+        progress.finish_step()
+
+    progress.start("committing the accepted profile and reporting the test round")
+    committed, validation_passed, holdout_passed = profile_update_gate(
+        old_metrics,
+        new_metrics,
+        old_holdout_metrics,
+        new_holdout_metrics,
+        holdout_expected=manifest_snapshot is not None,
     )
-    _write_profile_build_report(history_root, report)
+    test_metrics = evaluate_profile_post_adaptation(
+        proposed_model_path,
+        current_sessions,
+        inner_adaptation_mode=inner_adaptation_mode,
+        inner_epochs=inner_epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        pose_checkpoint=pose_checkpoint,
+        device=device,
+        evaluation_role="test",
+        adaptation_seed=0,
+    )
+
+    candidates = (
+        _holdout_candidates_for_archives(current_archive_paths)
+        if has_explicit_test_round
+        else ()
+    )
+    manifest_before = (
+        paths.holdout_manifest.read_bytes()
+        if manifest_snapshot is not None
+        else None
+    )
+    metrics_path = paths.root / "profile_metrics.json"
+    previous_metrics = metrics_path.read_bytes() if metrics_path.exists() else None
+    pending_profile = paths.root / f".profile_model.{timestamp}.pending"
+    pending_metrics = paths.root / f".profile_metrics.{timestamp}.pending"
+    metrics_installed = False
+    report_json = history_root / "profile_build_report.json"
+    report_csv = history_root / "profile_build_summary.csv"
+    holdout_update: HoldoutUpdate | None = None
+    try:
+        if committed:
+            shutil.copy2(proposed_model_path, pending_profile)
+            _write_json(
+                pending_metrics,
+                {
+                    "validation_metrics": new_metrics,
+                    "holdout_metrics": new_holdout_metrics,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                },
+            )
+
+        if manifest_snapshot is not None and candidates:
+            holdout_update = replace_next_slot_after_decision(
+                paths.holdout_manifest,
+                candidates,
+                decision_id=timestamp,
+                committed=committed,
+            )
+
+        report = ProfileBuildReport(
+            user_id=user_id,
+            profile_model=str(paths.profile_model),
+            proposed_model=str(proposed_model_path),
+            committed=committed,
+            start_checkpoint=str(start_checkpoint),
+            history_dir=str(history_root),
+            session_count=len(sessions),
+            old_metrics=old_metrics,
+            new_metrics=new_metrics,
+            old_session_metrics=tuple(old_session_metrics),
+            session_metrics=tuple(session_metrics),
+            session_block_summaries={
+                session.name: _summarize_profile_session_blocks(session)
+                for session in sessions
+            },
+            validation_passed=validation_passed,
+            holdout_passed=holdout_passed,
+            old_holdout_metrics=old_holdout_metrics,
+            new_holdout_metrics=new_holdout_metrics,
+            test_metrics=tuple(test_metrics),
+            holdout_update=(
+                asdict(holdout_update)
+                if holdout_update is not None
+                else None
+            ),
+        )
+        _write_profile_build_report(history_root, report)
+
+        # Make the primary profile the final state change. A failure before this
+        # point leaves the installed profile untouched and rolls the holdout back.
+        if committed:
+            pending_metrics.replace(metrics_path)
+            metrics_installed = True
+            pending_profile.replace(paths.profile_model)
+    except Exception:
+        if manifest_before is not None:
+            paths.holdout_manifest.write_bytes(manifest_before)
+        if metrics_installed:
+            if previous_metrics is None:
+                metrics_path.unlink(missing_ok=True)
+            else:
+                metrics_path.write_bytes(previous_metrics)
+        report_json.unlink(missing_ok=True)
+        report_csv.unlink(missing_ok=True)
+        raise
+    finally:
+        pending_profile.unlink(missing_ok=True)
+        pending_metrics.unlink(missing_ok=True)
+
     progress.finish_step()
     progress.start("complete")
     return report
@@ -541,19 +847,77 @@ def load_profile_session(
 ) -> ProfileSession:
     source_paths, name = _profile_session_source_paths(path)
     parts = [_load_profile_arrays(source_path) for source_path in source_paths]
+    preprocessing_signature = parts[0]["preprocessing_signature"]
+    for source_path, part in zip(source_paths[1:], parts[1:]):
+        require_matching_preprocessing(
+            preprocessing_signature,
+            part["preprocessing_signature"],
+            source=str(source_path),
+        )
     lengths = [len(part["eeg"]) for part in parts]
     eeg = np.concatenate([part["eeg"] for part in parts], axis=0)
+    target_eligible = np.concatenate(
+        [np.asarray(part["target_eligible"], dtype=bool) for part in parts]
+    )
+    history_eligible = np.concatenate(
+        [np.asarray(part["history_eligible"], dtype=bool) for part in parts]
+    )
+    assert target_eligible.shape == history_eligible.shape == (len(eeg),)
+    assert not np.any(target_eligible & ~history_eligible)
     block_ids = _merged_block_ids(parts)
-    if block_ids is not None:
+    has_round_roles = all("round_role" in part for part in parts)
+    if has_round_roles:
+        round_roles = np.concatenate(
+            [np.asarray(part["round_role"]).astype(str) for part in parts]
+        )
+        unknown_roles = sorted(
+            set(round_roles.tolist()) - {"support", "query", "validation", "test"}
+        )
+        if unknown_roles:
+            raise ValueError(f"Unknown profile round roles: {unknown_roles}.")
+        support_indices = np.flatnonzero(
+            (round_roles == "support") & target_eligible
+        ).astype(np.int64)
+        query_indices = np.flatnonzero(
+            (round_roles == "query") & target_eligible
+        ).astype(np.int64)
+        validation_indices = np.flatnonzero(
+            (round_roles == "validation") & target_eligible
+        ).astype(np.int64)
+        test_indices = np.flatnonzero(
+            (round_roles == "test") & target_eligible
+        ).astype(np.int64)
+        if any(
+            len(indices) == 0
+            for indices in (
+                support_indices,
+                query_indices,
+                validation_indices,
+                test_indices,
+            )
+        ):
+            raise ValueError(
+                "A four-round profile session must contain target-eligible "
+                "support, query, validation, and test frames."
+            )
+    elif block_ids is not None:
         support_indices, query_indices = _support_query_indices_for_blocks(
             block_ids,
             query_fraction=query_fraction,
         )
+        validation_indices = query_indices
+        test_indices = np.empty(0, dtype=np.int64)
+        round_roles = np.full(len(eeg), "support", dtype="<U10")
+        round_roles[query_indices] = "query"
     else:
         support_indices, query_indices = _support_query_indices_for_files(
             lengths,
             query_fraction=query_fraction,
         )
+        validation_indices = query_indices
+        test_indices = np.empty(0, dtype=np.int64)
+        round_roles = np.full(len(eeg), "support", dtype="<U10")
+        round_roles[query_indices] = "query"
     return ProfileSession(
         name=name,
         source_paths=tuple(source_paths),
@@ -570,13 +934,22 @@ def load_profile_session(
         ),
         support_indices=support_indices,
         query_indices=query_indices,
+        validation_indices=validation_indices,
+        test_indices=test_indices,
+        round_roles=round_roles,
+        target_eligible=target_eligible,
+        history_eligible=history_eligible,
         block_ids=block_ids,
+        block_names=_concatenate_optional(parts, "block_name"),
+        block_is_rest=_concatenate_optional(parts, "block_is_rest"),
+        block_accepted=_concatenate_optional(parts, "block_accepted"),
         block_summary=tuple(
             summary
             for part in parts
             for summary in part.get("block_summary", ())
         ),
         posture=_first_nonempty(part.get("posture", "") for part in parts),
+        preprocessing_signature=preprocessing_signature,
     )
 
 
@@ -592,37 +965,89 @@ def evaluate_profile_post_adaptation(
     device: str | torch.device = DEFAULT_DEVICE,
     progress: _ProfileBuildProgress | None = None,
     progress_phase: str = "evaluating profile",
+    evaluation_role: str = "query",
+    adaptation_seed: int | None = None,
 ) -> list[PostAdaptationMetrics]:
-    metrics = []
+    if not sessions:
+        return []
+    model = _load_raw_model(checkpoint, device)
     pose_decoder = _load_pose_decoder(
         pose_checkpoint,
         pose_latent_dim=sessions[0].pose_latent.shape[1],
         device=device,
     )
+    return _evaluate_profile_model_post_adaptation(
+        model,
+        sessions,
+        inner_adaptation_mode=inner_adaptation_mode,
+        inner_epochs=inner_epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        pose_decoder=pose_decoder,
+        device=device,
+        progress=progress,
+        progress_phase=progress_phase,
+        evaluation_role=evaluation_role,
+        adaptation_seed=adaptation_seed,
+    )
+
+
+def _evaluate_profile_model_post_adaptation(
+    model_template: EegPoseVAE,
+    sessions: list[ProfileSession],
+    *,
+    inner_adaptation_mode: str,
+    inner_epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    pose_decoder: nn.Module | None,
+    device: str | torch.device,
+    progress: _ProfileBuildProgress | None = None,
+    progress_phase: str = "evaluating profile",
+    evaluation_role: str = "query",
+    adaptation_seed: int | None = None,
+) -> list[PostAdaptationMetrics]:
+    metrics = []
     for session_index, session in enumerate(sessions):
         if progress is not None:
             progress.start(
                 f"{progress_phase}, session "
                 f"{session_index + 1}/{len(sessions)} ({session.name})"
             )
-        model = _load_raw_model(checkpoint, device)
+        model = copy.deepcopy(model_template)
         reset_band_adapter_identity(model)
-        _train_model_on_session_split(
-            model,
-            session,
-            session.support_indices,
-            mode=inner_adaptation_mode,
-            epochs=inner_epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-            pose_decoder=pose_decoder,
-            device=device,
-        )
+        with _forked_torch_seed(
+            None
+            if adaptation_seed is None
+            else adaptation_seed + session_index
+        ):
+            _train_model_on_session_split(
+                model,
+                session,
+                session.support_indices,
+                mode=inner_adaptation_mode,
+                epochs=inner_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                pose_decoder=pose_decoder,
+                device=device,
+            )
+        evaluation_indices = {
+            "query": session.query_indices,
+            "validation": session.validation_indices,
+            "test": session.test_indices,
+        }.get(evaluation_role)
+        if evaluation_indices is None:
+            raise ValueError(
+                f"Unsupported profile evaluation role {evaluation_role!r}."
+            )
+        if len(evaluation_indices) == 0:
+            continue
         metrics.append(
             _evaluate_query_metrics(
                 model,
                 session,
-                session.query_indices,
+                evaluation_indices,
                 pose_decoder=pose_decoder,
                 device=device,
             )
@@ -630,6 +1055,210 @@ def evaluate_profile_post_adaptation(
         if progress is not None:
             progress.finish_step()
     return metrics
+
+
+def evaluate_permanent_holdout(
+    checkpoint: str | Path,
+    manifest: PermanentHoldoutManifest,
+    *,
+    inner_adaptation_mode: str = EEG_ADAPTATION_MODE_ADAPTER_HEAD,
+    inner_epochs: int = EEG_PROFILE_BUILD_INNER_EPOCHS,
+    batch_size: int = EEG_MODEL_BATCH_SIZE,
+    learning_rate: float = EEG_MODEL_LR,
+    pose_checkpoint: str | Path | None = POSE_ENCODING_MODEL,
+    device: str | torch.device = DEFAULT_DEVICE,
+    adaptation_seed: int | None = None,
+) -> list[PostAdaptationMetrics]:
+    """Evaluate one equally weighted metric record per active holdout slot."""
+    require_complete_manifest(manifest)
+    active_slots = [
+        slot
+        for category in manifest.categories
+        if (slot := manifest.slots[category]) is not None
+    ]
+    assert len(active_slots) == len(manifest.categories)
+
+    metrics = []
+    pose_decoder: nn.Module | None = None
+    for slot_index, slot in enumerate(active_slots):
+        session, indices = _load_exact_holdout_slot(slot, manifest)
+
+        model = _load_raw_model(checkpoint, device)
+        assert session.preprocessing_signature is not None
+        require_matching_preprocessing(
+            preprocessing_signature_from_config(model.config),
+            session.preprocessing_signature,
+            source=f"permanent holdout block {slot.category}",
+        )
+        reset_band_adapter_identity(model)
+        if pose_decoder is None:
+            pose_decoder = _load_pose_decoder(
+                pose_checkpoint,
+                pose_latent_dim=session.pose_latent.shape[1],
+                device=device,
+            )
+        with _forked_torch_seed(
+            None
+            if adaptation_seed is None
+            else adaptation_seed + slot_index
+        ):
+            _train_model_on_session_split(
+                model,
+                session,
+                session.support_indices,
+                mode=inner_adaptation_mode,
+                epochs=inner_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                pose_decoder=pose_decoder,
+                device=device,
+            )
+        metric = _evaluate_query_metrics(
+            model,
+            session,
+            indices,
+            pose_decoder=pose_decoder,
+            device=device,
+        )
+        metrics.append(
+            replace(
+                metric,
+                session=f"{slot.source_session_id}:{slot.category}",
+            )
+        )
+    return metrics
+
+
+def _load_exact_holdout_slot(
+    slot: HoldoutSlot,
+    manifest: PermanentHoldoutManifest,
+) -> tuple[ProfileSession, np.ndarray]:
+    source_path = Path(slot.source_path)
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"Permanent holdout source archive is missing: {source_path}."
+        )
+    if (
+        source_path.name == "paired_profile_session.npz"
+        and len(list(source_path.parent.glob("source_*.npz"))) > 1
+    ):
+        raise ValueError(
+            "Permanent holdout source is an ambiguous multi-source merged "
+            f"archive: {source_path}."
+        )
+
+    raw_indices = np.asarray(slot.sample_indices, dtype=np.int64)
+    if len(raw_indices) != slot.sample_count:
+        raise ValueError(
+            f"Permanent holdout slot {slot.category} sample count changed."
+        )
+    with np.load(source_path) as archive:
+        sample_total = len(archive["eeg"])
+        if (
+            len(np.unique(raw_indices)) != len(raw_indices)
+            or np.any(raw_indices < 0)
+            or np.any(raw_indices >= sample_total)
+        ):
+            raise ValueError(
+                f"Permanent holdout slot {slot.category} has invalid sample indices."
+            )
+
+        archive_signature = preprocessing_signature_from_archive(archive)
+        signature = canonical_preprocessing_signature(archive_signature)
+        checksum = checksum_preprocessing_signature(signature)
+        if (
+            signature != manifest.preprocessing_signature
+            or checksum != manifest.preprocessing_checksum
+            or signature != slot.preprocessing_signature
+            or checksum != slot.preprocessing_checksum
+        ):
+            raise ValueError(
+                f"Permanent holdout slot {slot.category} preprocessing changed."
+            )
+        data_checksum = checksum_archive_rows(
+            archive,
+            raw_indices,
+            preprocessing_checksum=checksum,
+        )
+        if data_checksum != slot.data_checksum:
+            raise ValueError(
+                f"Permanent holdout slot {slot.category} source checksum changed."
+            )
+
+        _verify_holdout_slot_metadata(archive, raw_indices, slot)
+        target_eligible = _profile_archive_target_eligible(archive)
+        if target_eligible.shape != (sample_total,):
+            raise ValueError(
+                f"Permanent holdout slot {slot.category} frame eligibility "
+                "metadata has the wrong length."
+            )
+        evaluation_indices = raw_indices[target_eligible[raw_indices]]
+        if len(evaluation_indices) == 0:
+            raise ValueError(
+                f"Permanent holdout slot {slot.category} has no trusted "
+                "split-eligible samples."
+            )
+
+    # Passing a list deliberately loads this exact archive instead of following
+    # sibling source_*.npz files.
+    session = load_profile_session([source_path])
+    if (
+        len(session.eeg) != sample_total
+        or np.any(evaluation_indices < 0)
+        or np.any(evaluation_indices >= len(session.eeg))
+        or not np.all(session.target_eligible[evaluation_indices])
+    ):
+        raise ValueError(
+            f"Permanent holdout slot {slot.category} could not be loaded exactly."
+        )
+    return session, evaluation_indices
+
+
+def _verify_holdout_slot_metadata(
+    archive: np.lib.npyio.NpzFile,
+    indices: np.ndarray,
+    slot: HoldoutSlot,
+) -> None:
+    required = (
+        "profile_block_id",
+        "profile_block_name",
+        "profile_round_role",
+    )
+    missing = [key for key in required if key not in archive.files]
+    if missing:
+        raise ValueError(
+            f"Permanent holdout source {slot.source_path} is missing {missing}."
+        )
+    block_ids = np.asarray(archive["profile_block_id"], dtype=np.int64)
+    block_names = np.asarray(archive["profile_block_name"]).astype(str)
+    roles = np.asarray(archive["profile_round_role"]).astype(str)
+    if not np.all(block_ids[indices] == slot.source_block_id):
+        raise ValueError(
+            f"Permanent holdout slot {slot.category} block id changed."
+        )
+    if not np.all(block_names[indices] == slot.source_block_name):
+        raise ValueError(
+            f"Permanent holdout slot {slot.category} block name changed."
+        )
+    if not np.all(roles[indices] == "test"):
+        raise ValueError(
+            f"Permanent holdout slot {slot.category} is no longer a test block."
+        )
+    if "profile_block_repeat_index" in archive.files:
+        repeats = np.asarray(
+            archive["profile_block_repeat_index"],
+            dtype=np.int64,
+        )
+        if not np.all(repeats[indices] == slot.source_repeat_index):
+            raise ValueError(
+                f"Permanent holdout slot {slot.category} repeat index changed."
+            )
+    if "profile_session_id" in archive.files:
+        source_session_id = str(np.asarray(archive["profile_session_id"]).item())
+        if source_session_id != slot.source_session_id:
+            raise ValueError(
+                f"Permanent holdout slot {slot.category} session id changed."
+            )
 
 
 def summarize_post_adaptation_metrics(
@@ -650,6 +1279,94 @@ def summarize_post_adaptation_metrics(
             np.mean([metric.readiness_score for metric in metrics])
         ),
     }
+
+
+def summarize_permanent_holdout_metrics(
+    metrics: list[PostAdaptationMetrics],
+    manifest: PermanentHoldoutManifest,
+) -> dict[str, float]:
+    require_complete_manifest(manifest)
+    if len(metrics) != len(manifest.categories):
+        raise ValueError(
+            "Permanent holdout metric count does not match the manifest: "
+            f"{len(metrics)} != {len(manifest.categories)}."
+        )
+    by_category = dict(zip(manifest.categories, metrics, strict=True))
+    rest_metrics = [by_category["rest"]]
+    movement_metrics = [
+        by_category[category]
+        for category in manifest.categories
+        if category != "rest"
+    ]
+    return {
+        "pose_mae": float(np.mean([metric.pose_mae for metric in metrics])),
+        "decoded_pose_error": float(
+            np.mean([metric.decoded_pose_error for metric in metrics])
+        ),
+        "stationary_false_positive_score": float(
+            np.mean(
+                [
+                    metric.stationary_false_positive_score
+                    for metric in rest_metrics
+                ]
+            )
+        ),
+        "movement_response_score": float(
+            np.mean(
+                [
+                    metric.movement_response_score
+                    for metric in movement_metrics
+                ]
+            )
+        ),
+        "readiness_score": float(
+            np.mean([metric.readiness_score for metric in metrics])
+        ),
+    }
+
+
+def _holdout_candidates_for_archives(
+    archive_paths: list[Path],
+):
+    candidates = []
+    for archive_path in archive_paths:
+        with np.load(archive_path) as archive:
+            if "profile_round_role" not in archive.files:
+                continue
+            roles = np.asarray(archive["profile_round_role"]).astype(str)
+            target_eligible = _profile_archive_target_eligible(archive)
+            if target_eligible.shape != roles.shape:
+                raise ValueError(
+                    f"Frame eligibility length mismatch in {archive_path}."
+                )
+            test_indices = np.flatnonzero(roles == "test").astype(np.int64)
+            if "profile_block_id" not in archive.files:
+                raise ValueError(
+                    f"Four-round holdout archive has no block IDs: {archive_path}."
+                )
+            block_ids = np.asarray(archive["profile_block_id"], dtype=np.int64)
+            if len(block_ids) != len(roles):
+                raise ValueError(
+                    f"Block-id length mismatch in {archive_path}."
+                )
+            eligible_block_ids = set(
+                int(block_id)
+                for block_id in block_ids[
+                    (roles == "test") & target_eligible
+                ]
+            )
+            preprocessing = preprocessing_signature_from_archive(archive)
+        if len(test_indices) == 0:
+            continue
+        candidates.extend(
+            candidates_from_test_blocks(
+                archive_path,
+                test_indices,
+                preprocessing=preprocessing,
+                eligible_block_ids=eligible_block_ids,
+            )
+        )
+    return tuple(candidates)
 
 
 def _write_profile_session_archives(
@@ -758,6 +1475,7 @@ def _profile_session_source_paths(
 
 def _load_profile_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path) as archive:
+        preprocessing_signature = preprocessing_signature_from_archive(archive)
         accepted_mask = (
             np.asarray(archive["profile_block_accepted"], dtype=bool)
             if "profile_block_accepted" in archive.files
@@ -784,14 +1502,103 @@ def _load_profile_arrays(path: Path) -> dict[str, np.ndarray]:
         }
         if "profile_block_id" in archive.files:
             arrays["block_id"] = np.asarray(archive["profile_block_id"], dtype=np.int64)
-        if accepted_mask is not None:
+        has_round_roles = "profile_round_role" in archive.files
+        if has_round_roles:
+            arrays["round_role"] = np.asarray(archive["profile_round_role"]).astype(str)
+            if "profile_block_name" in archive.files:
+                arrays["block_name"] = np.asarray(archive["profile_block_name"]).astype(str)
+            if "profile_block_is_rest" in archive.files:
+                arrays["block_is_rest"] = np.asarray(
+                    archive["profile_block_is_rest"],
+                    dtype=bool,
+                )
+            if accepted_mask is not None:
+                arrays["block_accepted"] = accepted_mask
+            target_eligible = _profile_archive_target_eligible(archive)
+            history_eligible = _profile_archive_history_eligible(archive)
+            expected_shape = (len(arrays["eeg"]),)
+            if target_eligible.shape != expected_shape:
+                raise ValueError(
+                    f"Target-eligibility metadata in {path} must have shape "
+                    f"{expected_shape}, got {target_eligible.shape}."
+                )
+            if history_eligible.shape != expected_shape:
+                raise ValueError(
+                    f"History-eligibility metadata in {path} must have shape "
+                    f"{expected_shape}, got {history_eligible.shape}."
+                )
+            arrays["target_eligible"] = target_eligible
+            arrays["history_eligible"] = history_eligible
+        elif accepted_mask is not None:
             arrays = {
                 key: value[accepted_mask]
                 for key, value in arrays.items()
             }
+            arrays["target_eligible"] = np.ones(
+                len(arrays["eeg"]),
+                dtype=bool,
+            )
+            arrays["history_eligible"] = np.ones(
+                len(arrays["eeg"]),
+                dtype=bool,
+            )
+        else:
+            arrays["target_eligible"] = np.ones(
+                len(arrays["eeg"]),
+                dtype=bool,
+            )
+            arrays["history_eligible"] = np.ones(
+                len(arrays["eeg"]),
+                dtype=bool,
+            )
         arrays["block_summary"] = block_summary
         arrays["posture"] = posture
+        arrays["preprocessing_signature"] = preprocessing_signature
         return arrays
+
+
+def _profile_archive_target_eligible(
+    archive: np.lib.npyio.NpzFile,
+) -> np.ndarray:
+    expected_shape = (len(archive["eeg"]),)
+    trusted = (
+        np.asarray(archive["profile_frame_trusted"], dtype=bool)
+        if "profile_frame_trusted" in archive.files
+        else trusted_calibration_mask(archive)
+    )
+    if trusted.shape != expected_shape:
+        raise ValueError(
+            "profile_frame_trusted must have shape "
+            f"{expected_shape}, got {trusted.shape}."
+        )
+    return trusted & _profile_archive_history_eligible(archive)
+
+
+def _profile_archive_history_eligible(
+    archive: np.lib.npyio.NpzFile,
+) -> np.ndarray:
+    expected_shape = (len(archive["eeg"]),)
+    if "profile_frame_split_eligible" in archive.files:
+        eligible = np.asarray(
+            archive["profile_frame_split_eligible"],
+            dtype=bool,
+        )
+        if eligible.shape != expected_shape:
+            raise ValueError(
+                "profile_frame_split_eligible must have shape "
+                f"{expected_shape}, got {eligible.shape}."
+            )
+        return eligible
+    return np.ones(expected_shape, dtype=bool)
+
+
+def _concatenate_optional(
+    parts: list[dict[str, np.ndarray]],
+    key: str,
+) -> np.ndarray | None:
+    if not all(key in part for part in parts):
+        return None
+    return np.concatenate([np.asarray(part[key]) for part in parts])
 
 
 def _load_block_summary_json(
@@ -943,6 +1750,16 @@ def _safe_name(value: str) -> str:
     return safe or "session"
 
 
+@contextmanager
+def _forked_torch_seed(seed: int | None):
+    if seed is None:
+        yield
+        return
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        yield
+
+
 def _train_model_on_session_split(
     model: EegPoseVAE,
     session: ProfileSession,
@@ -957,7 +1774,7 @@ def _train_model_on_session_split(
 ) -> None:
     if epochs <= 0 or len(indices) == 0:
         return
-    eeg = _session_eeg_contexts(model, session)[indices]
+    eeg = _session_eeg_contexts_for_indices(model, session, indices)
     target_raw = session.pose_latent[indices]
     target_model = standardize_pose_latents(target_raw, model.config)
     dataset = TensorDataset(
@@ -1023,7 +1840,7 @@ def _evaluate_query_metrics(
     pose_decoder: nn.Module | None,
     device: str | torch.device,
 ) -> PostAdaptationMetrics:
-    eeg = _session_eeg_contexts(model, session)[indices]
+    eeg = _session_eeg_contexts_for_indices(model, session, indices)
     target = session.pose_latent[indices]
     with torch.no_grad():
         predicted_model = model.predict_pose_latent(torch.from_numpy(eeg).to(device))
@@ -1078,11 +1895,39 @@ def _evaluate_query_metrics(
     )
 
 
-def _session_eeg_contexts(model: EegPoseVAE, session: ProfileSession) -> np.ndarray:
-    return build_context_windows(
-        transform_eeg_for_model(session.eeg, model.config),
+def _session_eeg_contexts(
+    model: EegPoseVAE,
+    session: ProfileSession,
+) -> tuple[np.ndarray, np.ndarray]:
+    features = transform_eeg_for_model(session.eeg, model.config)
+    contexts, target_indices = build_eligible_grouped_context_windows(
+        features,
+        session.round_roles,
+        session.target_eligible,
+        session.history_eligible,
         context_packet_count=model.config.context_packet_count,
     )
+    expected_target_indices = np.flatnonzero(
+        session.target_eligible
+    ).astype(np.int64)
+    assert np.array_equal(target_indices, expected_target_indices)
+    return contexts, target_indices
+
+
+def _session_eeg_contexts_for_indices(
+    model: EegPoseVAE,
+    session: ProfileSession,
+    indices: np.ndarray,
+) -> np.ndarray:
+    contexts, target_indices = _session_eeg_contexts(model, session)
+    context_position = np.full(len(session.eeg), -1, dtype=np.int64)
+    context_position[target_indices] = np.arange(
+        len(target_indices),
+        dtype=np.int64,
+    )
+    positions = context_position[indices]
+    assert np.all(positions >= 0)
+    return contexts[positions]
 
 
 def _copy_profile_core_state(source: EegPoseVAE, target: EegPoseVAE) -> None:
@@ -1159,6 +2004,12 @@ def _write_profile_build_report(history_root: Path, report: ProfileBuildReport) 
             ),
             "session_metrics": [asdict(metric) for metric in report.session_metrics],
             "session_block_summaries": report.session_block_summaries,
+            "validation_passed": report.validation_passed,
+            "holdout_passed": report.holdout_passed,
+            "old_holdout_metrics": report.old_holdout_metrics,
+            "new_holdout_metrics": report.new_holdout_metrics,
+            "test_metrics": [asdict(metric) for metric in report.test_metrics],
+            "holdout_update": report.holdout_update,
         },
     )
     old_by_session = {

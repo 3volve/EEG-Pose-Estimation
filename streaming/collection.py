@@ -12,6 +12,7 @@ from .records import PairedTrainingFrame
 
 if TYPE_CHECKING:
     from pose_encoding import PoseLatentFrame
+    from .debug_capture import RawPoseEegDebugCapture
 
 
 class EegPacketStream(Protocol):
@@ -47,6 +48,7 @@ def collect_paired_frames(
     duration_s: float,
     max_pose_gap_s: float = PAIRING_MAX_POSE_GAP_S,
     poll_delay_s: float = PAIRING_POLL_DELAY_S,
+    debug_capture: "RawPoseEegDebugCapture | None" = None,
 ) -> list[PairedTrainingFrame]:
     pose_buffer = PoseLatentBuffer(max_gap_s=max_pose_gap_s)
     frames: list[PairedTrainingFrame] = []
@@ -54,9 +56,14 @@ def collect_paired_frames(
     deadline = time.monotonic() + duration_s
 
     while time.monotonic() < deadline:
-        pose_buffer.add(pose_stream.get_latest())
+        pose_frame = pose_stream.get_latest()
+        pose_buffer.add(pose_frame)
+        if debug_capture is not None:
+            debug_capture.record_processed_pose(pose_frame)
         packet = eeg_stream.pop_packet()
         if packet is not None:
+            if debug_capture is not None:
+                debug_capture.record_eeg_packet(packet)
             pending_packets.append(packet)
 
         still_pending: list[EegPacket] = []
@@ -83,12 +90,17 @@ def collect_and_save_paired_frames(
     out_path: str,
     max_pose_gap_s: float = PAIRING_MAX_POSE_GAP_S,
     metadata: dict[str, object] | None = None,
+    debug_capture: "RawPoseEegDebugCapture | None" = None,
 ) -> list[PairedTrainingFrame]:
     frames = collect_paired_frames(
         eeg_stream,
         pose_stream,
         duration_s=duration_s,
         max_pose_gap_s=max_pose_gap_s,
+        debug_capture=debug_capture,
     )
-    save_paired_frames(out_path, frames, metadata=metadata)
+    save_paired_frames(
+        out_path, frames,
+        metadata={**(metadata or {}), "pairing_pose_time_basis": "capture_timestamp_ms"},
+    )
     return frames

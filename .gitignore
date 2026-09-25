@@ -4,6 +4,7 @@ __pycache__/
 /test_outputs
 /eval_tools
 /profiles
+/research/data_pipeline/outputs/
 
 
 /.agents

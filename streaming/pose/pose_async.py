@@ -49,6 +49,8 @@ class AsyncPoseEstimator:
         draw_preview: bool = False,
         draw_builtin_pose_overlay: bool = True,
         preview_renderer: Callable[[Any, ModuleType, PoseResult | None, bool], None] | None = None,
+        result_observer: Callable[[PoseResult], None] | None = None,
+        preview_key_handler: Callable[[int], None] | None = None,
     ) -> None:
         if target_fps <= 0:
             raise ValueError("target_fps must be greater than zero")
@@ -62,6 +64,8 @@ class AsyncPoseEstimator:
         self.draw_preview = draw_preview
         self.draw_builtin_pose_overlay = draw_builtin_pose_overlay
         self.preview_renderer = preview_renderer
+        self.result_observer = result_observer
+        self.preview_key_handler = preview_key_handler
 
         self._results: Queue[PoseResult] = Queue(maxsize=result_queue_size)
         self._latest: PoseResult | None = None
@@ -228,16 +232,18 @@ class AsyncPoseEstimator:
                 self._stop_event.set()
                 break
 
-            rgb_frame = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
-            mp_image = self._mp.Image(
-                image_format=self._mp.ImageFormat.SRGB,
-                data=rgb_frame,
-            )
+            # Timestamp camera delivery before image conversion or inference.
             timestamp_ms = max(
                 time.monotonic_ns() // 1_000_000,
                 last_timestamp_ms + 1,
             )
             last_timestamp_ms = timestamp_ms
+
+            rgb_frame = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+            mp_image = self._mp.Image(
+                image_format=self._mp.ImageFormat.SRGB,
+                data=rgb_frame,
+            )
             self._landmarker.detect_async(mp_image, timestamp_ms)
 
             if self.draw_preview:
@@ -258,8 +264,11 @@ class AsyncPoseEstimator:
                     )
                 self._cv2.imshow(self._PREVIEW_WINDOW, preview_frame)
                 self._preview_created = True
-                if self._cv2.waitKey(1) & 0xFF == ord("q"):
+                key = self._cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
                     self._stop_event.set()
+                elif key != 255 and self.preview_key_handler is not None:
+                    self.preview_key_handler(key)
 
             next_capture_time = max(
                 next_capture_time + frame_period_s,
@@ -338,6 +347,8 @@ class AsyncPoseEstimator:
             world_landmarks=world_landmarks,
             pose_detected=pose_detected,
         )
+        if self.result_observer is not None:
+            self.result_observer(pose_result)
 
         with self._latest_lock:
             self._latest = pose_result

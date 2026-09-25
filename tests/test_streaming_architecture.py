@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from eeg_encoding import (
@@ -52,6 +53,7 @@ from streaming import (
     validate_profile_block,
 )
 from streaming.records import PairedTrainingFrame
+from streaming.calibration import _aligned_head_guide_positions
 
 
 def output_path(name: str) -> Path:
@@ -105,9 +107,10 @@ def test_signal_streamer_emits_packet_ids_and_end_times() -> None:
 
 def test_pose_buffer_interpolates_bracketing_latents() -> None:
     buffer = PoseLatentBuffer(max_gap_s=1.0)
-    buffer.add(make_pose_frame(1, 10.0, 0.0, confidence=0.9))
-    buffer.add(make_pose_frame(2, 10.5, 2.0, confidence=0.7))
+    buffer.add(make_pose_frame(10000, 10.3, 0.0, confidence=0.9))
+    buffer.add(make_pose_frame(10500, 10.9, 2.0, confidence=0.7))
 
+    assert buffer.latest_time_s == 10.5
     interpolated = buffer.latent_at(10.25)
 
     assert interpolated is not None
@@ -118,8 +121,8 @@ def test_pose_buffer_interpolates_bracketing_latents() -> None:
 
 def test_pose_buffer_rejects_missing_or_stale_brackets() -> None:
     buffer = PoseLatentBuffer(max_gap_s=0.1)
-    buffer.add(make_pose_frame(1, 10.0, 0.0))
-    buffer.add(make_pose_frame(2, 10.5, 2.0))
+    buffer.add(make_pose_frame(10000, 10.3, 0.0))
+    buffer.add(make_pose_frame(10500, 10.9, 2.0))
 
     assert buffer.latent_at(9.9) is None
     assert buffer.latent_at(10.25) is None
@@ -128,8 +131,8 @@ def test_pose_buffer_rejects_missing_or_stale_brackets() -> None:
 
 def test_pair_packet_targets_eeg_end_time() -> None:
     buffer = PoseLatentBuffer(max_gap_s=3.0)
-    buffer.add(make_pose_frame(1, 4.0, 0.0))
-    buffer.add(make_pose_frame(2, 6.0, 2.0))
+    buffer.add(make_pose_frame(4000, 4.3, 0.0))
+    buffer.add(make_pose_frame(6000, 6.9, 2.0))
     packet = EegPacket(
         packet_id=3,
         samples=np.zeros((2, 4), dtype=np.float32),
@@ -165,14 +168,14 @@ def test_collection_keeps_packet_pending_until_future_pose_arrives() -> None:
     class FakePoseStream:
         def __init__(self) -> None:
             self.frames = [
-                make_pose_frame(1, 10.0, 0.0),
-                make_pose_frame(2, 10.5, 2.0),
+                make_pose_frame(10000, 10.3, 0.0),
+                make_pose_frame(10500, 10.9, 2.0),
             ]
 
         def get_latest(self) -> PoseLatentFrame | None:
             if self.frames:
                 return self.frames.pop(0)
-            return make_pose_frame(2, 10.5, 2.0)
+            return make_pose_frame(10500, 10.9, 2.0)
 
     paired = collect_paired_frames(
         FakeEegStream(),
@@ -677,6 +680,51 @@ def test_profile_build_creates_primary_profile_from_paired_data() -> None:
     torch.testing.assert_close(model.band_adapter.bias, torch.zeros_like(model.band_adapter.bias))
 
 
+def test_profile_finalization_failure_leaves_primary_profile_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = unique_output_path("profile_build_atomic_failure")
+    profiles_root = root / "profiles"
+    data_path = root / "session_01.npz"
+    base_path = root / "base.pt"
+    make_profile_build_dataset(data_path, 39)
+    train_model(
+        data_path,
+        base_path,
+        epochs=1,
+        batch_size=4,
+        hidden_dim=16,
+        model_latent_dim=5,
+        pose_checkpoint=None,
+    )
+    profile_model = profiles_root / "profile_user" / "profile_model.pt"
+    real_replace = Path.replace
+
+    def fail_profile_replace(path: Path, target: Path):
+        if Path(target) == profile_model:
+            raise OSError("simulated profile finalization failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_profile_replace)
+
+    with pytest.raises(OSError, match="simulated profile finalization failure"):
+        build_profile_model(
+            user_id="profile_user",
+            new_session_data=data_path,
+            base_checkpoint=base_path,
+            profiles_root=profiles_root,
+            epochs=1,
+            inner_epochs=1,
+            query_epochs=1,
+            batch_size=4,
+            pose_checkpoint=None,
+        )
+
+    assert not profile_model.exists()
+    assert not (profile_model.parent / "profile_metrics.json").exists()
+    assert not list(profile_model.parent.glob(".profile_*.pending"))
+
+
 def test_second_profile_build_uses_existing_profile_and_session_history() -> None:
     root = unique_output_path("profile_build_existing")
     profiles_root = root / "profiles"
@@ -754,9 +802,9 @@ def test_profile_session_uses_block_level_query_split_when_available() -> None:
                     "left_arm_raise",
                     "right_arm_raise",
                     "right_arm_raise",
-                    "torso_shift",
-                    "torso_shift",
-                    "torso_shift",
+                    "torso_side_lean",
+                    "torso_side_lean",
+                    "torso_side_lean",
                 ]
             ),
             "profile_block_repeat_index": np.asarray([0, 0, 0, 0, 0, 0, 0, 0, 0]),
@@ -765,7 +813,7 @@ def test_profile_session_uses_block_level_query_split_when_available() -> None:
                 '[{"movement_name":"neutral_rest","accepted":true},'
                 '{"movement_name":"left_arm_raise","accepted":true},'
                 '{"movement_name":"right_arm_raise","accepted":true},'
-                '{"movement_name":"torso_shift","accepted":true}]'
+                '{"movement_name":"torso_side_lean","accepted":true}]'
             ),
         }
     )
@@ -1012,6 +1060,55 @@ def test_dummy_calibration_motion_changes_target_pose() -> None:
     assert mid[4, 1] < start[4, 1]
 
 
+def test_torso_side_lean_keeps_hip_root_and_aligns_guide_head() -> None:
+    neutral = dummy_positions_for_block(
+        "torso_side_lean",
+        elapsed_s=0.0,
+        duration_s=8.0,
+    )
+    leaned = dummy_positions_for_block(
+        "torso_side_lean",
+        elapsed_s=2.0,
+        duration_s=8.0,
+    )
+
+    np.testing.assert_allclose(leaned[[6, 7]], neutral[[6, 7]])
+    assert leaned[[0, 1], 0].mean() > neutral[[0, 1], 0].mean()
+
+    neck, head = _aligned_head_guide_positions(leaned)
+    hip_center = leaned[[6, 7]].mean(axis=0)
+    shoulder_center = leaned[[0, 1]].mean(axis=0)
+    torso_axis = shoulder_center - hip_center
+    np.testing.assert_allclose(
+        np.cross(torso_axis, head - shoulder_center),
+        np.zeros(3),
+        atol=1e-6,
+    )
+    assert np.dot(head - neck, torso_axis) > 0.0
+
+
+def test_profile_block_validator_accepts_torso_side_lean() -> None:
+    vectors = feature_vectors_for_block("torso_side_lean")
+
+    result = validate_profile_block(
+        block_id=7,
+        block=CalibrationMovementBlock(
+            "torso_side_lean",
+            "shoulders_core",
+            8.0,
+        ),
+        repeat_index=0,
+        start_time_s=10.0,
+        end_time_s=18.0,
+        feature_vectors=vectors,
+        pose_confidences=[0.85] * len(vectors),
+        paired_sample_count=20,
+    )
+
+    assert result.accepted is True
+    assert result.reject_reason == ""
+
+
 def feature_vectors_for_block(name: str, *, duration_s: float = 8.0, samples: int = 12) -> list[np.ndarray]:
     vectors = []
     for elapsed_s in np.linspace(0.0, duration_s, samples):
@@ -1108,7 +1205,7 @@ def test_profile_block_validator_rejects_inactive_movement_block() -> None:
 
 
 def test_profile_block_validator_rejects_overactive_rest_block() -> None:
-    vectors = feature_vectors_for_block("torso_shift")
+    vectors = feature_vectors_for_block("torso_side_lean")
 
     result = validate_profile_block(
         block_id=5,
@@ -1126,7 +1223,7 @@ def test_profile_block_validator_rejects_overactive_rest_block() -> None:
 
 
 def test_profile_block_validator_rejects_wrong_motion_pattern() -> None:
-    vectors = feature_vectors_for_block("torso_shift")
+    vectors = feature_vectors_for_block("torso_side_lean")
 
     result = validate_profile_block(
         block_id=6,

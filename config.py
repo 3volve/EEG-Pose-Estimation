@@ -6,17 +6,22 @@ BASE_OUTPUT_DIR = ROOT_DIR / "output"
 
 
 # EEG packet stream.
-EEG_CHANNELS: int = 4
+EEG_SOURCE_CHANNEL_INDICES: tuple[int, ...] = (1, 2, 3, 4)
+EEG_CHANNELS: int = len(EEG_SOURCE_CHANNEL_INDICES)
 EEG_SAMPLE_RATE: int = 250
 EEG_PACKET_SIZE: int = 200
 EEG_PACKET_STRIDE: int = 50
-EEG_STREAM_TIMEOUT_MARGIN_S: float = 0.01
+EEG_ACQUISITION_SAMPLES: int = 5
+EEG_ACQUISITION_TIMEOUT_S: float = 0.02
+EEG_BANDSTOP_HZ: tuple[float, float] = (55.0, 65.0)
+EEG_BANDSTOP_ORDER: int = 4
+EEG_PREPROCESSING_VERSION: str = "lsl-columns-1-4-bandstop-55-65-v1"
 
 
 # EEG encoding defaults.
 EEG_MODELS_ROOT: Path = ROOT_DIR / "eeg_encoding" / "models"
-EEG_ENCODING_MODEL: str = str(EEG_MODELS_ROOT / "<placeholder>.pt")
-EEG_PROFILES_ROOT: Path = ROOT_DIR / "profiles"
+EEG_ENCODING_MODEL: str = str(EEG_MODELS_ROOT / "eeg_base_corrected_v1.pt")
+EEG_PROFILES_ROOT: Path = ROOT_DIR / "profiles" / EEG_PREPROCESSING_VERSION
 
 
 # Pose stream and pose encoding defaults.

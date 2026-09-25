@@ -28,6 +28,7 @@ from streaming.records import PairedTrainingFrame
 
 from .model import (
     EegPoseVAE,
+    preprocessing_signature_from_config,
     context_from_history,
     save_model,
     set_trainable_scope,
@@ -224,7 +225,10 @@ class OnlineEegCalibrator:
             save_paired_frames(
                 session_path / "trusted_calibration_samples.npz",
                 self._trusted_frames,
-                metadata={"sample_kind": "online_trusted_calibration"},
+                metadata={
+                    **preprocessing_signature_from_config(self.model.config),
+                    "sample_kind": "online_trusted_calibration",
+                },
             )
         status = self.status()
         (session_path / "online_status.json").write_text(
