@@ -1,6 +1,6 @@
 # EEG-Pose-Estimation
 
-I'm exploring whether EEG signals can be used to estimate upper-body pose andmovement. I use webcam-based pose tracking to provide training targets, then train models to predict those representations from EEG.
+I'm exploring whether EEG signals can be used to estimate upper-body pose and movement. I use webcam-based pose tracking to provide training targets, then train models to predict those representations from EEG.
 
 This is an active exploratory research prototype, bringing together signal processing, machine learning, real-time data collection, and experimental evaluation.
 
